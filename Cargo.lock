@@ -2750,6 +2750,7 @@ name = "sbom-tools"
 version = "0.1.21"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "clap_complete",

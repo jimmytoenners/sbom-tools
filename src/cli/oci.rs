@@ -16,15 +16,17 @@
 //! these handlers print what they *would* do, then exit with
 //! [`exit_codes::ERROR`].
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::Result;
+use serde::Serialize;
 
 use crate::oci::{
-    ArtifactKind, AuthInputs, DiscoveryPreference, OciReference, OciResolver, OciResolverConfig,
-    VerificationInputs, VerificationPolicy,
+    ArtifactFile, ArtifactKind, AuthInputs, DiscoveryPreference, OciReference, OciResolver,
+    OciResolverConfig, ResolvedArtifacts, VerificationInputs, VerificationPolicy,
 };
-use crate::pipeline::exit_codes;
+use crate::pipeline::{OutputTarget, exit_codes, write_output};
 use crate::reports::ReportFormat;
 
 /// Which `oci` operation to perform.
@@ -133,19 +135,26 @@ pub fn run_oci(config: OciCliConfig, action: OciAction) -> Result<i32> {
 
     // 5. Run the resolver. With `--no-verify` this actually fetches; with
     // verification policies it returns NotImplemented until sigstore lands.
-    match resolver.resolve(&reference) {
-        Ok(resolved) => {
-            if !config.quiet {
-                print_resolved(&resolved);
-            }
-            Ok(exit_codes::SUCCESS)
-        }
+    let resolved = match resolver.resolve(&reference) {
+        Ok(r) => r,
         Err(e) => {
             eprintln!();
             eprintln!("oci {}: {e}", action.label());
-            Ok(exit_codes::ERROR)
+            return Ok(exit_codes::ERROR);
         }
+    };
+
+    if !config.quiet {
+        print_resolved(&resolved);
     }
+
+    // 6. For `oci report`, additionally parse, enrich, apply VEX, and emit
+    // the vulnerability picture.
+    if matches!(action, OciAction::Report) {
+        return run_report_pipeline(&resolved, &config);
+    }
+
+    Ok(exit_codes::SUCCESS)
 }
 
 fn parse_prefer(s: &str) -> Result<DiscoveryPreference> {
@@ -284,6 +293,237 @@ fn print_resolved(resolved: &crate::oci::ResolvedArtifacts) {
     ) {
         println!("  verification: skipped (--no-verify)");
     }
+}
+
+// ============================================================================
+// `oci report` — parse + enrich + VEX overlay + summary
+// ============================================================================
+
+/// Aggregate vuln/component totals across one or more SBOMs.
+#[derive(Debug, Default, Serialize)]
+struct ReportTotals {
+    components: usize,
+    vulnerabilities: usize,
+    by_severity: BTreeMap<String, usize>,
+    with_vex: usize,
+    actionable: usize,
+    gaps: usize,
+}
+
+/// Per-SBOM summary for the JSON report.
+#[derive(Debug, Serialize)]
+struct SbomSummary {
+    path: PathBuf,
+    media_type: String,
+    components: usize,
+    vulnerabilities: usize,
+    with_vex: usize,
+    actionable: usize,
+    gaps: usize,
+}
+
+/// JSON envelope written to stdout / `--output-file` when `--output json`.
+#[derive(Debug, Serialize)]
+struct ReportJson<'a> {
+    image_digest: &'a str,
+    sboms: &'a [SbomSummary],
+    vex_docs: Vec<PathBuf>,
+    totals: &'a ReportTotals,
+}
+
+/// Run the `oci report` pipeline: parse every fetched SBOM, enrich with
+/// OSV/KEV when requested, apply the fetched VEX docs as an overlay, and
+/// emit a vuln picture.
+fn run_report_pipeline(resolved: &ResolvedArtifacts, config: &OciCliConfig) -> Result<i32> {
+    if resolved.sboms.is_empty() {
+        eprintln!();
+        eprintln!("oci report: no SBOM artifacts attached to this image — nothing to analyse");
+        return Ok(exit_codes::SUCCESS);
+    }
+
+    let vex_paths: Vec<PathBuf> = resolved.vex_docs.iter().map(|af| af.path.clone()).collect();
+
+    let mut totals = ReportTotals::default();
+    let mut per_sbom = Vec::new();
+    for sbom_af in &resolved.sboms {
+        match analyse_one_sbom(sbom_af, &vex_paths, config) {
+            Ok((s, severities)) => {
+                for (sev, count) in &severities {
+                    *totals.by_severity.entry(sev.clone()).or_insert(0) += count;
+                }
+                totals.merge(&s);
+                per_sbom.push(s);
+            }
+            Err(e) => {
+                eprintln!("warning: failed to analyse {}: {e}", sbom_af.path.display());
+            }
+        }
+    }
+
+    let target = OutputTarget::from_option(config.output_file.clone());
+    let body = if matches!(config.output_format, ReportFormat::Json) {
+        let envelope = ReportJson {
+            image_digest: &resolved.image_digest,
+            sboms: &per_sbom,
+            vex_docs: vex_paths.clone(),
+            totals: &totals,
+        };
+        serde_json::to_string_pretty(&envelope)?
+    } else {
+        render_text_report(&resolved.image_digest, &per_sbom, &totals, &vex_paths)
+    };
+    write_output(&body, &target, config.quiet)?;
+
+    // Exit codes — actionable vulns trump VEX gaps (more specific).
+    if config.fail_on_vuln && totals.actionable > 0 {
+        return Ok(exit_codes::VULNS_INTRODUCED);
+    }
+    if config.fail_on_vex_gap && totals.gaps > 0 {
+        return Ok(exit_codes::VEX_GAPS_FOUND);
+    }
+    Ok(exit_codes::SUCCESS)
+}
+
+impl ReportTotals {
+    fn merge(&mut self, s: &SbomSummary) {
+        self.components += s.components;
+        self.vulnerabilities += s.vulnerabilities;
+        self.with_vex += s.with_vex;
+        self.actionable += s.actionable;
+        self.gaps += s.gaps;
+    }
+}
+
+fn analyse_one_sbom(
+    sbom_af: &ArtifactFile,
+    vex_paths: &[PathBuf],
+    config: &OciCliConfig,
+) -> Result<(SbomSummary, BTreeMap<String, usize>)> {
+    let quiet = config.quiet;
+    let mut parsed = crate::pipeline::parse_sbom_with_context(&sbom_af.path, quiet)?;
+
+    #[cfg(feature = "enrichment")]
+    {
+        if config.enrich_vulns {
+            let env_cfg = oci_enrichment_config();
+            let osv_cfg = crate::pipeline::build_enrichment_config(&env_cfg);
+            crate::pipeline::enrich_sbom(parsed.sbom_mut(), &osv_cfg, quiet);
+        }
+        if !vex_paths.is_empty() {
+            let _ = crate::pipeline::enrich_vex(parsed.sbom_mut(), vex_paths, quiet);
+        }
+    }
+    #[cfg(not(feature = "enrichment"))]
+    {
+        let _ = vex_paths;
+        if config.enrich_vulns {
+            eprintln!("warning: --enrich-vulns ignored — build without the `enrichment` feature");
+        }
+    }
+
+    Ok(summarise_sbom(parsed.sbom(), sbom_af))
+}
+
+#[cfg(feature = "enrichment")]
+fn oci_enrichment_config() -> crate::config::EnrichmentConfig {
+    crate::config::EnrichmentConfig {
+        enabled: true,
+        provider: "osv".to_string(),
+        cache_ttl_hours: 24,
+        max_concurrent: 10,
+        cache_dir: Some(crate::pipeline::dirs::osv_cache_dir()),
+        bypass_cache: false,
+        timeout_secs: 30,
+        enable_eol: false,
+        vex_paths: Vec::new(),
+    }
+}
+
+/// Walk an SBOM and produce per-SBOM totals plus a severity histogram.
+/// The histogram is returned separately so the caller can merge it into the
+/// overall `ReportTotals.by_severity` without bloating `SbomSummary`.
+fn summarise_sbom(
+    sbom: &crate::model::NormalizedSbom,
+    sbom_af: &ArtifactFile,
+) -> (SbomSummary, BTreeMap<String, usize>) {
+    use crate::model::VexState;
+
+    let mut summary = SbomSummary {
+        path: sbom_af.path.clone(),
+        media_type: sbom_af.media_type.clone(),
+        components: sbom.components.len(),
+        vulnerabilities: 0,
+        with_vex: 0,
+        actionable: 0,
+        gaps: 0,
+    };
+    let mut severities: BTreeMap<String, usize> = BTreeMap::new();
+    for comp in sbom.components.values() {
+        for vuln in &comp.vulnerabilities {
+            summary.vulnerabilities += 1;
+            let sev_label = vuln
+                .severity
+                .as_ref()
+                .map_or_else(|| "Unknown".to_string(), ToString::to_string);
+            *severities.entry(sev_label).or_insert(0) += 1;
+            let vex = vuln.vex_status.as_ref().or(comp.vex_status.as_ref());
+            match vex.map(|v| &v.status) {
+                Some(VexState::NotAffected) | Some(VexState::Fixed) => {
+                    summary.with_vex += 1;
+                }
+                Some(_) => {
+                    summary.with_vex += 1;
+                    summary.actionable += 1;
+                }
+                None => {
+                    summary.actionable += 1;
+                    summary.gaps += 1;
+                }
+            }
+        }
+    }
+    (summary, severities)
+}
+
+fn render_text_report(
+    image_digest: &str,
+    per_sbom: &[SbomSummary],
+    totals: &ReportTotals,
+    vex_paths: &[PathBuf],
+) -> String {
+    let mut out = String::new();
+    use std::fmt::Write as _;
+    let _ = writeln!(out, "\nOCI Vulnerability Report");
+    let _ = writeln!(out, "========================");
+    let _ = writeln!(out, "Image:               {image_digest}");
+    let _ = writeln!(out, "SBOMs analysed:      {}", per_sbom.len());
+    let _ = writeln!(out, "VEX docs applied:    {}", vex_paths.len());
+    let _ = writeln!(out, "Components:          {}", totals.components);
+    let _ = writeln!(out, "Vulnerabilities:     {}", totals.vulnerabilities);
+    if !totals.by_severity.is_empty() {
+        for (sev, count) in &totals.by_severity {
+            let _ = writeln!(out, "  {sev:<18} {count}");
+        }
+    }
+    let _ = writeln!(out, "With VEX statement:  {}", totals.with_vex);
+    let _ = writeln!(out, "Actionable:          {}", totals.actionable);
+    let _ = writeln!(out, "VEX coverage gaps:   {}", totals.gaps);
+    if per_sbom.len() > 1 {
+        let _ = writeln!(out, "\nPer-SBOM breakdown:");
+        for s in per_sbom {
+            let _ = writeln!(
+                out,
+                "  {} — components={} vulns={} with-vex={} actionable={} gaps={}",
+                s.path.display(),
+                s.components,
+                s.vulnerabilities,
+                s.with_vex,
+                s.actionable,
+                s.gaps
+            );
+        }
+    }
+    out
 }
 
 #[cfg(test)]

@@ -133,6 +133,27 @@ pub struct InTotoSubject {
     pub digest: BTreeMap<String, String>,
 }
 
+/// Base64-decode a DSSE envelope's `payload` and parse it as an in-toto
+/// Statement.
+///
+/// DSSE encodes the payload with standard base64 (RFC 4648, with padding).
+/// This does **not** verify the envelope's signatures — that lands with the
+/// `sigstore` dependency. It only opens the wrapper so the in-toto
+/// Statement (and its predicate) is reachable.
+///
+/// # Errors
+///
+/// Returns [`OciError::Parse`] for base64 / UTF-8 / JSON / shape failures.
+pub fn unwrap_dsse_to_statement(env: &DsseEnvelope) -> Result<InTotoStatement, OciError> {
+    use base64::Engine;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(env.payload.as_bytes())
+        .map_err(|e| OciError::Parse(format!("DSSE payload base64: {e}")))?;
+    let json = std::str::from_utf8(&raw)
+        .map_err(|e| OciError::Parse(format!("DSSE payload utf-8: {e}")))?;
+    parse_in_toto_statement(json)
+}
+
 /// Parse an in-toto Statement from a (DSSE-decoded) JSON string.
 ///
 /// # Errors
@@ -266,6 +287,66 @@ mod tests {
     fn dsse_is_in_toto_predicate() {
         let env = parse_dsse_envelope(DSSE_OK).unwrap();
         assert!(env.is_in_toto());
+    }
+
+    // ---- DSSE unwrap (base64 -> in-toto Statement) -------------------------
+
+    #[test]
+    fn unwrap_dsse_round_trips_through_base64() {
+        // The DSSE_OK payload base64-decodes to an in-toto v1 _type-only stub,
+        // which is insufficient for a full Statement. Build a real envelope.
+        use base64::Engine;
+        let stmt = r#"{
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": [{ "digest": { "sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789" } }],
+            "predicateType": "https://cyclonedx.org/bom",
+            "predicate": { "bomFormat": "CycloneDX" }
+        }"#;
+        let payload_b64 = base64::engine::general_purpose::STANDARD.encode(stmt.as_bytes());
+        let env_json = format!(
+            r#"{{
+                "payloadType": "application/vnd.in-toto+json",
+                "payload": "{payload_b64}",
+                "signatures": [{{ "keyid": "k", "sig": "s" }}]
+            }}"#
+        );
+        let env = parse_dsse_envelope(&env_json).unwrap();
+        let stmt_out = unwrap_dsse_to_statement(&env).unwrap();
+        assert_eq!(stmt_out.predicate_type, "https://cyclonedx.org/bom");
+        assert_eq!(stmt_out.subject.len(), 1);
+    }
+
+    #[test]
+    fn unwrap_dsse_rejects_invalid_base64() {
+        let env = DsseEnvelope {
+            payload_type: IN_TOTO_PAYLOAD_TYPE.to_string(),
+            payload: "!!! not base64 !!!".to_string(),
+            signatures: vec![DsseSignature {
+                keyid: None,
+                sig: "x".to_string(),
+            }],
+        };
+        assert!(matches!(
+            unwrap_dsse_to_statement(&env),
+            Err(OciError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn unwrap_dsse_rejects_non_json_payload() {
+        use base64::Engine;
+        let env = DsseEnvelope {
+            payload_type: IN_TOTO_PAYLOAD_TYPE.to_string(),
+            payload: base64::engine::general_purpose::STANDARD.encode(b"not json"),
+            signatures: vec![DsseSignature {
+                keyid: None,
+                sig: "x".to_string(),
+            }],
+        };
+        assert!(matches!(
+            unwrap_dsse_to_statement(&env),
+            Err(OciError::Parse(_))
+        ));
     }
 
     // ---- in-toto Statement -------------------------------------------------

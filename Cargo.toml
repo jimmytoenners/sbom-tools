@@ -60,6 +60,8 @@ oci-client = { version = "0.15", default-features = false, features = ["rustls-t
 # `Builder::enable_all()` (IO + timer drivers); `fs` + `io-util` give us
 # `tokio::fs::File` + `AsyncWriteExt` for the blob writes.
 tokio = { version = "1", features = ["rt", "time", "net", "fs", "io-util"], optional = true }
+# Base64 decoder for DSSE envelope payloads (in-toto Statement unwrap).
+base64 = { version = "0.22", optional = true }
 
 # Utilities
 chrono = { version = "0.4.44", features = ["serde"] }
@@ -81,7 +83,7 @@ enrichment = ["reqwest"]
 # Currently pulls in the registry-fetch deps (oci-client + tokio);
 # cosign verification (sigstore) lands in a follow-up commit — see
 # docs/oci-verify-plan.md.
-oci = ["dep:oci-client", "dep:tokio"]
+oci = ["dep:oci-client", "dep:tokio", "dep:base64"]
 ffi = []
 
 [dev-dependencies]

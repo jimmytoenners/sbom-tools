@@ -32,6 +32,7 @@ mod client;
 pub use attestation::{
     DsseEnvelope, DsseSignature, InTotoStatement, InTotoSubject, classify_predicate,
     is_known_predicate, parse_dsse_envelope, parse_in_toto_statement, subject_matches_image_digest,
+    unwrap_dsse_to_statement,
 };
 
 // ============================================================================

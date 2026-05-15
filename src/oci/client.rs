@@ -191,30 +191,31 @@ fn extract_layers(
     client: &Client,
     referrer_ref: &Reference,
     manifest: &OciImageManifest,
-    kind: ArtifactKind,
+    initial_kind: ArtifactKind,
     scheme: DiscoveryScheme,
     output_dir: &Path,
     sboms: &mut Vec<ArtifactFile>,
     vex_docs: &mut Vec<ArtifactFile>,
 ) {
     for layer in &manifest.layers {
-        let path = blob_path(output_dir, kind, &layer.digest, &layer.media_type);
-        if let Err(e) = fetch_blob_to_file(runtime, client, referrer_ref, layer, &path) {
-            eprintln!("warning: failed to fetch blob {}: {e}", layer.digest);
+        let Some((final_kind, af)) = materialize_blob(
+            runtime,
+            client,
+            referrer_ref,
+            layer,
+            initial_kind,
+            manifest.artifact_type.as_deref(),
+            scheme,
+            output_dir,
+        ) else {
             continue;
-        }
-        let af = ArtifactFile {
-            path,
-            media_type: layer.media_type.clone(),
-            predicate_type: manifest.artifact_type.clone(),
-            discovered_via: scheme,
         };
-        match kind {
+        match final_kind {
             ArtifactKind::Sbom => sboms.push(af),
             ArtifactKind::Vex => vex_docs.push(af),
-            // Generic attestations (SLSA provenance, vuln scans, …) are not
-            // SBOM/VEX themselves; recorded by future verify.rs as findings,
-            // not stored here in v1.
+            // Generic attestations (SLSA provenance, cosign vuln-scan, …)
+            // are kept on disk for the future verifier but not surfaced
+            // here as SBOM/VEX.
             ArtifactKind::Attestation => {}
         }
     }
@@ -238,51 +239,29 @@ fn try_cosign_tag_scheme(
     let Some(tag_prefix) = cosign_tag_prefix(image_digest) else {
         return;
     };
-
-    // Legacy cosign SBOM tag.
-    let sbom_tag = format!("{tag_prefix}.sbom");
-    try_fetch_cosign_tag(
-        runtime,
-        client,
-        base_ref,
-        auth,
-        &sbom_tag,
-        ArtifactKind::Sbom,
-        output_dir,
-        sboms,
-    );
-
-    // Modern cosign attestation tag — may carry SBOM or VEX inside a DSSE
-    // envelope. Without unwrapping (which lands with verify.rs / base64) we
-    // can't classify reliably, so we pessimistically write it under sbom/.
-    let att_tag = format!("{tag_prefix}.att");
-    try_fetch_cosign_tag(
-        runtime,
-        client,
-        base_ref,
-        auth,
-        &att_tag,
-        ArtifactKind::Sbom,
-        output_dir,
-        sboms,
-    );
-
-    // VEX-via-tag-scheme is rare; left empty deliberately. Future verify.rs
-    // will unwrap DSSE-wrapped .att blobs and re-classify as VEX where the
-    // in-toto predicateType is `https://openvex.dev/ns/...`.
-    let _ = vex_docs;
+    // Try both the legacy `.sbom` tag and the modern DSSE-wrapped `.att`
+    // tag. `materialize_blob` unwraps DSSE envelopes and re-classifies the
+    // contents by in-toto `predicateType`, so something on the `.att` tag
+    // that turns out to be a VEX, vuln-scan, or SLSA attestation is sorted
+    // into the right bucket instead of being labelled SBOM by default.
+    for suffix in [".sbom", ".att"] {
+        let tag = format!("{tag_prefix}{suffix}");
+        try_cosign_tag(
+            runtime, client, base_ref, auth, &tag, output_dir, sboms, vex_docs,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn try_fetch_cosign_tag(
+fn try_cosign_tag(
     runtime: &Runtime,
     client: &Client,
     base_ref: &Reference,
     auth: &RegistryAuth,
     tag: &str,
-    kind: ArtifactKind,
     output_dir: &Path,
-    out: &mut Vec<ArtifactFile>,
+    sboms: &mut Vec<ArtifactFile>,
+    vex_docs: &mut Vec<ArtifactFile>,
 ) {
     let raw = format!(
         "{}/{}:{}",
@@ -303,20 +282,23 @@ fn try_fetch_cosign_tag(
         Err(_) => return,
     };
     for layer in &manifest.layers {
-        let path = blob_path(output_dir, kind, &layer.digest, &layer.media_type);
-        if let Err(e) = fetch_blob_to_file(runtime, client, &tag_ref, layer, &path) {
-            eprintln!(
-                "warning: failed to fetch cosign-tag blob {}: {e}",
-                layer.digest
-            );
+        let Some((final_kind, af)) = materialize_blob(
+            runtime,
+            client,
+            &tag_ref,
+            layer,
+            ArtifactKind::Sbom,
+            manifest.artifact_type.as_deref(),
+            DiscoveryScheme::CosignTag,
+            output_dir,
+        ) else {
             continue;
+        };
+        match final_kind {
+            ArtifactKind::Sbom => sboms.push(af),
+            ArtifactKind::Vex => vex_docs.push(af),
+            ArtifactKind::Attestation => {}
         }
-        out.push(ArtifactFile {
-            path,
-            media_type: layer.media_type.clone(),
-            predicate_type: manifest.artifact_type.clone(),
-            discovered_via: DiscoveryScheme::CosignTag,
-        });
     }
 }
 
@@ -327,6 +309,186 @@ fn cosign_tag_prefix(image_digest: &str) -> Option<String> {
         return None;
     }
     Some(format!("{algo}-{hex}"))
+}
+
+// ============================================================================
+// Post-fetch materialisation: unwrap DSSE envelopes, re-classify
+// ============================================================================
+
+/// Fetch a blob to disk and, when it is a DSSE envelope wrapping a known
+/// in-toto predicate (CycloneDX / SPDX / OpenVEX), unwrap it.
+///
+/// Returns the *final* artifact kind — which may differ from the caller's
+/// `initial_kind` because cosign's `.att` tag and the OCI Referrers API both
+/// hand back DSSE envelopes whose real classification is only knowable after
+/// reading the inner `predicateType`. The returned [`ArtifactFile`] points
+/// at the consumable file: either the unwrapped predicate JSON or, when
+/// unwrap isn't possible, the envelope itself.
+///
+/// When unwrap succeeds for a known SBOM/VEX predicate, two files end up on
+/// disk side by side:
+///
+/// - `<kind>-<short>.dsse.json` — the original DSSE envelope (audit trail
+///   for the future cosign-verification pass).
+/// - `<kind>-<short>.cdx.json` / `.spdx.json` / `.openvex.json` — the inner
+///   predicate, ready to feed into the existing parsers.
+///
+/// `ArtifactFile.path` is the inner predicate; the envelope is reachable
+/// through the filename convention.
+///
+/// On unknown predicates (SLSA provenance, cosign vuln-scan, …) the
+/// envelope is kept and the kind is set to [`ArtifactKind::Attestation`].
+#[allow(clippy::too_many_arguments)]
+fn materialize_blob(
+    runtime: &Runtime,
+    client: &Client,
+    image: &Reference,
+    layer: &OciDescriptor,
+    initial_kind: ArtifactKind,
+    descriptor_predicate_type: Option<&str>,
+    scheme: DiscoveryScheme,
+    output_dir: &Path,
+) -> Option<(ArtifactKind, ArtifactFile)> {
+    let raw_path = blob_path(output_dir, initial_kind, &layer.digest, &layer.media_type);
+    if let Err(e) = fetch_blob_to_file(runtime, client, image, layer, &raw_path) {
+        eprintln!("warning: failed to fetch blob {}: {e}", layer.digest);
+        return None;
+    }
+
+    // Non-DSSE artifact: keep as-is.
+    if !layer.media_type.to_lowercase().contains("dsse.envelope") {
+        return Some((
+            initial_kind,
+            ArtifactFile {
+                path: raw_path,
+                media_type: layer.media_type.clone(),
+                predicate_type: descriptor_predicate_type.map(String::from),
+                discovered_via: scheme,
+            },
+        ));
+    }
+
+    // DSSE: try to unwrap. Any failure falls back to the envelope so the
+    // user still has the file on disk.
+    let unwrap = std::fs::read_to_string(&raw_path)
+        .map_err(OciError::Io)
+        .and_then(|s| super::attestation::parse_dsse_envelope(&s))
+        .and_then(|env| super::attestation::unwrap_dsse_to_statement(&env));
+
+    let stmt = match unwrap {
+        Ok(s) => s,
+        Err(_) => {
+            return Some((
+                initial_kind,
+                ArtifactFile {
+                    path: raw_path,
+                    media_type: layer.media_type.clone(),
+                    predicate_type: descriptor_predicate_type.map(String::from),
+                    discovered_via: scheme,
+                },
+            ));
+        }
+    };
+
+    let predicate_type = stmt.predicate_type.clone();
+
+    // Unknown / non-SBOM-non-VEX predicate — keep envelope, classify as Attestation.
+    let Some(real_kind) = super::attestation::classify_predicate(&predicate_type) else {
+        return Some((
+            ArtifactKind::Attestation,
+            ArtifactFile {
+                path: raw_path,
+                media_type: layer.media_type.clone(),
+                predicate_type: Some(predicate_type),
+                discovered_via: scheme,
+            },
+        ));
+    };
+
+    // Known SBOM/VEX predicate: write the inner predicate as a separate file
+    // alongside the envelope. The predicate is the "consumable" file.
+    let short = short_digest(&layer.digest);
+    let prefix = kind_prefix(real_kind);
+    let suffix = predicate_suffix(&predicate_type);
+    let envelope_path = output_dir.join(format!("{prefix}-{short}.dsse.json"));
+    let predicate_path = output_dir.join(format!("{prefix}-{short}{suffix}"));
+
+    let pred_json = match serde_json::to_vec_pretty(&stmt.predicate) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("warning: serialize predicate failed: {e}");
+            return Some((
+                real_kind,
+                ArtifactFile {
+                    path: raw_path,
+                    media_type: layer.media_type.clone(),
+                    predicate_type: Some(predicate_type),
+                    discovered_via: scheme,
+                },
+            ));
+        }
+    };
+    if let Err(e) = std::fs::write(&predicate_path, &pred_json) {
+        eprintln!("warning: write predicate failed: {e}");
+        return Some((
+            real_kind,
+            ArtifactFile {
+                path: raw_path,
+                media_type: layer.media_type.clone(),
+                predicate_type: Some(predicate_type),
+                discovered_via: scheme,
+            },
+        ));
+    }
+    if raw_path != envelope_path {
+        if let Err(e) = std::fs::rename(&raw_path, &envelope_path) {
+            // Envelope rename is non-fatal — the predicate file (what we
+            // hand back) is already in place.
+            eprintln!("warning: rename envelope failed: {e}");
+        }
+    }
+
+    let unwrapped_media = if predicate_type.starts_with("https://cyclonedx.org/bom") {
+        "application/vnd.cyclonedx+json"
+    } else if predicate_type.starts_with("https://spdx.dev/Document") {
+        "application/spdx+json"
+    } else if predicate_type.starts_with("https://openvex.dev/ns") {
+        "application/openvex+json"
+    } else {
+        "application/json"
+    };
+
+    Some((
+        real_kind,
+        ArtifactFile {
+            path: predicate_path,
+            media_type: unwrapped_media.to_string(),
+            predicate_type: Some(predicate_type),
+            discovered_via: scheme,
+        },
+    ))
+}
+
+/// Filename suffix to use when writing an unwrapped predicate to disk.
+fn predicate_suffix(predicate_type: &str) -> &'static str {
+    if predicate_type.starts_with("https://cyclonedx.org/bom") {
+        ".cdx.json"
+    } else if predicate_type.starts_with("https://spdx.dev/Document") {
+        ".spdx.json"
+    } else if predicate_type.starts_with("https://openvex.dev/ns") {
+        ".openvex.json"
+    } else {
+        ".json"
+    }
+}
+
+/// User-facing filename prefix for an [`ArtifactKind`].
+const fn kind_prefix(kind: ArtifactKind) -> &'static str {
+    match kind {
+        ArtifactKind::Sbom => "sbom",
+        ArtifactKind::Vex => "vex",
+        ArtifactKind::Attestation => "att",
+    }
 }
 
 // ============================================================================
@@ -404,12 +566,7 @@ fn blob_path(base: &Path, kind: ArtifactKind, digest: &str, media_type: &str) ->
     } else {
         "bin"
     };
-    let kind_prefix = match kind {
-        ArtifactKind::Sbom => "sbom",
-        ArtifactKind::Vex => "vex",
-        ArtifactKind::Attestation => "att",
-    };
-    base.join(format!("{kind_prefix}-{short}.{ext}"))
+    base.join(format!("{}-{short}.{ext}", kind_prefix(kind)))
 }
 
 fn short_digest(digest: &str) -> String {
