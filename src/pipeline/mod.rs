@@ -58,6 +58,10 @@ pub mod exit_codes {
     pub const VEX_GAPS_FOUND: i32 = 4;
     /// License policy violations found
     pub const LICENSE_VIOLATIONS: i32 = 5;
+    /// OCI artifact fetched but failed cosign verification: bad signature,
+    /// identity/issuer mismatch, digest-binding mismatch, or a required
+    /// attestation was absent (`oci verify` / `oci pull`).
+    pub const OCI_VERIFICATION_FAILED: i32 = 6;
 }
 
 /// Platform-specific cache directory utilities

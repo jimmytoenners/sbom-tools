@@ -39,6 +39,11 @@ pub struct AppConfig {
     /// Enrichment configuration (OSV, etc.)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enrichment: Option<EnrichmentConfig>,
+    /// OCI registry ingestion + cosign verification configuration.
+    ///
+    /// Always present in the config schema; only acted on by builds compiled
+    /// with the `oci` feature.
+    pub oci: OciConfig,
 }
 
 impl AppConfig {
@@ -525,6 +530,86 @@ pub struct VexConfig {
 // ============================================================================
 // Sub-configuration Types
 // ============================================================================
+
+/// OCI registry ingestion configuration (the `[oci]` section).
+///
+/// Lets CI pin a verification policy and discovery preferences once instead
+/// of repeating flags on every `oci` invocation. CLI flags override these.
+/// This is plain config data — the code that acts on it is gated behind the
+/// `oci` feature.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct OciConfig {
+    /// Directory for the digest-addressed blob cache.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_dir: Option<PathBuf>,
+    /// Discovery-scheme preference: `referrers` or `tag-scheme`.
+    pub prefer: String,
+    /// Allow plain HTTP / skip registry TLS verification (local registries).
+    pub insecure: bool,
+    /// Cosign verification policy.
+    pub verify: OciVerifyConfig,
+}
+
+impl Default for OciConfig {
+    fn default() -> Self {
+        Self {
+            cache_dir: None,
+            prefer: "referrers".to_string(),
+            insecure: false,
+            verify: OciVerifyConfig::default(),
+        }
+    }
+}
+
+/// Cosign verification policy (the `[oci.verify]` section).
+///
+/// Either `key` (key-based) or the keyless fields
+/// (`certificate_identity[_regexp]` + `certificate_oidc_issuer`) should be
+/// set — validation happens when the policy is built, so incoherent
+/// combinations are reported with a clear error rather than silently
+/// skipping verification.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct OciVerifyConfig {
+    /// Path to a cosign public key (key-based verification).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<PathBuf>,
+    /// Keyless: exact certificate identity (SAN) to require.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certificate_identity: Option<String>,
+    /// Keyless: certificate identity regex (mutually exclusive with the exact form).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certificate_identity_regexp: Option<String>,
+    /// Keyless: required OIDC issuer URL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certificate_oidc_issuer: Option<String>,
+    /// Sigstore trust root: `bundled` or a path to a custom TUF root.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_root: Option<String>,
+    /// Rekor transparency-log endpoint.
+    pub rekor_url: String,
+    /// Skip the Rekor inclusion check (air-gapped use).
+    pub ignore_tlog: bool,
+    /// in-toto predicate types that MUST be present and verified.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub require_attestations: Vec<String>,
+}
+
+impl Default for OciVerifyConfig {
+    fn default() -> Self {
+        Self {
+            key: None,
+            certificate_identity: None,
+            certificate_identity_regexp: None,
+            certificate_oidc_issuer: None,
+            trust_root: None,
+            rekor_url: "https://rekor.sigstore.dev".to_string(),
+            ignore_tlog: false,
+            require_attestations: Vec::new(),
+        }
+    }
+}
 
 /// Output-related configuration
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

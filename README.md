@@ -39,6 +39,7 @@ Semantic SBOM/CBOM diff, quality scoring, and analysis tool. Compare, validate, 
 - **Fleet Comparison** — 1:N baseline comparison, timeline analysis across versions, and NxN matrix analysis, all with enrichment support
 - **Incremental Diff** — Section-selective recomputation for partial changes with cached matching results
 - **VEX Tracking** — Detect VEX state transitions (NotAffected → Affected) across SBOM versions, with `--fail-on-vex-gap` CI gate
+- **OCI Registry Ingestion** *(preview, feature-gated)* — Pull and cosign-verify the SBOM/VEX artifacts attached to a container image, then feed them straight into the pipeline — see [`docs/oci-verify-plan.md`](docs/oci-verify-plan.md)
 - **Multiple Output Formats** — JSON, SARIF, HTML, Markdown, CSV, table, side-by-side, summary, and an interactive TUI
 - **Ecosystem-Aware** — Configurable per-ecosystem normalization rules, typosquat detection, pre-release version handling, and cross-ecosystem package correlation
 
@@ -105,6 +106,9 @@ cargo build --release
 
 # Without enrichment (lightweight build)
 cargo build --release --no-default-features
+
+# With OCI registry ingestion + cosign verification (preview)
+cargo build --release --features oci
 ```
 
 The binary is placed at `target/release/sbom-tools`.
@@ -516,6 +520,37 @@ sbom-tools timeline v1.json v2.json v3.json
 sbom-tools matrix sbom1.json sbom2.json sbom3.json
 ```
 
+### OCI registry ingestion (preview)
+
+Pull and cosign-verify the SBOM/VEX artifacts attached to a container image, then
+feed them straight into the diff/enrich/report pipeline. Built behind the
+off-by-default `oci` feature (`cargo build --release --features oci`).
+
+> **Status:** the command surface, image-reference parsing, and
+> verification-policy validation are implemented and tested. The registry client
+> and cosign verification — the `sigstore` / `oci-client` dependencies — are in
+> progress; see [`docs/oci-verify-plan.md`](docs/oci-verify-plan.md). Until they
+> land, the commands report what they *would* do and exit with code 3.
+
+```sh
+# Pull the SBOM/VEX attached to a digest-pinned image (keyless cosign policy)
+sbom-tools oci pull ghcr.io/acme/api@sha256:abc... \
+    --certificate-identity-regexp '^https://github.com/acme/.+' \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+# Verify an image's signature + attestations only (CI gate, SARIF out)
+sbom-tools oci verify ghcr.io/acme/api:v1.4.0 \
+    --key cosign.pub --require-attestation https://cyclonedx.org/bom \
+    -o sarif -O oci-verify.sarif
+
+# One-shot: pull + verify + enrich + vulnerability picture
+sbom-tools oci report ghcr.io/acme/api:v1.4.0 \
+    --key cosign.pub --standard cra --fail-on-vex-gap
+```
+
+See [`examples/oci-registry-ingestion.md`](examples/oci-registry-ingestion.md)
+for a full walkthrough including the `[oci]` config section.
+
 ### Shell completions
 
 ```sh
@@ -770,6 +805,7 @@ jobs:
 | `3` | Error |
 | `4` | VEX coverage gaps found (`--fail-on-vex-gap`) |
 | `5` | License policy violations found (`license-check`) |
+| `6` | OCI artifact verification failed (`oci verify` / `oci pull`) |
 
 ## Configuration
 
@@ -801,6 +837,7 @@ src/
 ├── matching/     Multi-tier fuzzy matching (PURL, alias, ecosystem, adaptive, LSH)
 ├── diff/         Semantic diffing engine with graph support + incremental section-selective diff
 ├── enrichment/   OSV/KEV vulnerability data + EOL detection + VEX (feature-gated)
+├── oci/          OCI registry ingestion + cosign verification (feature-gated: `oci`)
 ├── quality/      8-category scoring engine + CBOM crypto scoring profile + 11 compliance standards (NTIA/FDA/CRA/SSDF/EO 14028/CNSA 2.0/NIST PQC)
 ├── pipeline/     parse → enrich → diff → report orchestration + shared enrichment pipeline
 ├── reports/      9 output format generators + streaming reporter

@@ -11,6 +11,8 @@ mod enrich;
 mod license_check;
 mod merge;
 mod multi;
+#[cfg(feature = "oci")]
+mod oci;
 mod quality;
 mod query;
 mod tailor;
@@ -31,6 +33,8 @@ pub use enrich::run_enrich;
 pub use license_check::run_license_check;
 pub use merge::run_merge;
 pub use multi::{run_diff_multi, run_matrix, run_timeline};
+#[cfg(feature = "oci")]
+pub use oci::{OciAction, OciCliConfig, run_oci};
 pub use quality::run_quality;
 pub use query::{QueryFilter, run_query};
 pub use tailor::run_tailor;

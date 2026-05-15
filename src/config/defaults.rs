@@ -4,7 +4,8 @@
 
 use super::types::{
     AppConfig, BehaviorConfig, EcosystemRulesConfig, EnrichmentConfig, FilterConfig,
-    GraphAwareDiffConfig, MatchingConfig, MatchingRulesPathConfig, OutputConfig, TuiConfig,
+    GraphAwareDiffConfig, MatchingConfig, MatchingRulesPathConfig, OciConfig, OutputConfig,
+    TuiConfig,
 };
 
 // ============================================================================
@@ -131,6 +132,7 @@ impl AppConfig {
             },
             tui: TuiConfig::default(),
             enrichment: Some(EnrichmentConfig::default()),
+            oci: OciConfig::default(),
         }
     }
 
@@ -175,6 +177,7 @@ impl AppConfig {
             ecosystem_rules: EcosystemRulesConfig::default(),
             tui: TuiConfig::default(),
             enrichment: Some(EnrichmentConfig::default()),
+            oci: OciConfig::default(),
         }
     }
 
@@ -199,6 +202,7 @@ impl AppConfig {
             ecosystem_rules: EcosystemRulesConfig::default(),
             tui: TuiConfig::default(),
             enrichment: None,
+            oci: OciConfig::default(),
         }
     }
 
@@ -229,6 +233,7 @@ impl AppConfig {
             ecosystem_rules: EcosystemRulesConfig::default(),
             tui: TuiConfig::default(),
             enrichment: None,
+            oci: OciConfig::default(),
         }
     }
 }

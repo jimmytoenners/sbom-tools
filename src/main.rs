@@ -11,6 +11,8 @@
 use anyhow::{Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
+#[cfg(feature = "oci")]
+use sbom_tools::oci::VerificationInputs;
 use sbom_tools::{
     cli,
     config::{
@@ -52,6 +54,7 @@ const fn build_long_version() -> &'static str {
     3  Error occurred
     4  VEX gaps found (--fail-on-vex-gap)
     5  License policy violations found
+    6  OCI artifact verification failed (oci verify / oci pull)
 
 EXAMPLES:
   Comparing SBOMs:
@@ -821,6 +824,13 @@ enum Commands {
         action: VexAction,
     },
 
+    /// Pull and verify SBOM/VEX artifacts from an OCI registry (cosign)
+    #[cfg(feature = "oci")]
+    Oci {
+        #[command(subcommand)]
+        action: OciAction,
+    },
+
     /// Continuously monitor SBOMs for file changes and new vulnerabilities
     Watch(WatchArgs),
 
@@ -967,6 +977,182 @@ struct VexArgs {
     /// API timeout in seconds
     #[arg(long, default_value = "30")]
     api_timeout: u64,
+}
+
+/// Sub-subcommands for the `oci` command
+#[cfg(feature = "oci")]
+#[derive(Subcommand)]
+enum OciAction {
+    /// Pull SBOM/VEX artifacts attached to an image, verify, and write them to disk
+    Pull(OciPullArgs),
+    /// Verify an image's cosign signature and attestations; report + exit code only
+    Verify(OciVerifyArgs),
+    /// Pull + verify + enrich, then produce a vulnerability picture in one shot
+    Report(OciReportArgs),
+}
+
+/// Registry authentication flags shared by all `oci` subcommands.
+#[cfg(feature = "oci")]
+#[derive(Args)]
+struct OciAuthFlags {
+    /// Registry bearer token
+    #[arg(long, value_name = "TOKEN")]
+    registry_token: Option<String>,
+
+    /// Registry basic-auth username
+    #[arg(long, value_name = "USER")]
+    registry_username: Option<String>,
+
+    /// Registry basic-auth password (prefer the SBOM_TOOLS_REGISTRY_PASSWORD env var)
+    #[arg(long, value_name = "PASS", env = "SBOM_TOOLS_REGISTRY_PASSWORD")]
+    registry_password: Option<String>,
+}
+
+/// Cosign verification-policy flags shared by all `oci` subcommands.
+#[cfg(feature = "oci")]
+#[derive(Args)]
+struct OciVerifyFlags {
+    /// Skip cosign verification entirely (fetch only)
+    #[arg(long)]
+    no_verify: bool,
+
+    /// Cosign public key for key-based verification
+    #[arg(long, value_name = "PATH")]
+    key: Option<PathBuf>,
+
+    /// Keyless: exact certificate identity (SAN) to require
+    #[arg(long, value_name = "ID")]
+    certificate_identity: Option<String>,
+
+    /// Keyless: certificate identity regex (mutually exclusive with --certificate-identity)
+    #[arg(long, value_name = "REGEX", conflicts_with = "certificate_identity")]
+    certificate_identity_regexp: Option<String>,
+
+    /// Keyless: required OIDC issuer URL
+    #[arg(long, value_name = "URL")]
+    certificate_oidc_issuer: Option<String>,
+
+    /// Custom Sigstore TUF trust root (private Sigstore deployments)
+    #[arg(long, value_name = "PATH")]
+    trust_root: Option<PathBuf>,
+
+    /// Rekor transparency-log endpoint
+    #[arg(long, value_name = "URL", default_value = "https://rekor.sigstore.dev")]
+    rekor_url: String,
+
+    /// Air-gapped: skip the Rekor transparency-log inclusion check
+    #[arg(long)]
+    insecure_ignore_tlog: bool,
+
+    /// Fail if no verified attestation of this in-toto predicate type is present (repeatable)
+    #[arg(long = "require-attestation", value_name = "PREDICATE")]
+    require_attestation: Vec<String>,
+}
+
+/// Arguments for `oci pull`.
+#[cfg(feature = "oci")]
+#[derive(Args)]
+struct OciPullArgs {
+    /// Image reference (registry/repo:tag, registry/repo@sha256:..., or oci://...)
+    reference: String,
+
+    /// Directory to write extracted SBOM/VEX files into
+    #[arg(long, value_name = "DIR")]
+    output_dir: Option<PathBuf>,
+
+    /// Digest-addressed blob cache directory
+    #[arg(long, value_name = "DIR")]
+    cache_dir: Option<PathBuf>,
+
+    /// Platform selector (os/arch) for multi-arch image indexes
+    #[arg(long, value_name = "OS/ARCH")]
+    platform: Option<String>,
+
+    /// Artifact kinds to extract: sbom, vex, attestation, all (repeatable)
+    #[arg(long = "artifact", value_name = "KIND")]
+    artifact: Vec<String>,
+
+    /// Discovery preference: referrers or tag-scheme
+    #[arg(long, default_value = "referrers")]
+    prefer: String,
+
+    /// Allow plain HTTP / skip registry TLS verification (local registries)
+    #[arg(long)]
+    insecure: bool,
+
+    #[command(flatten)]
+    auth: OciAuthFlags,
+
+    #[command(flatten)]
+    verify: OciVerifyFlags,
+}
+
+/// Arguments for `oci verify`.
+#[cfg(feature = "oci")]
+#[derive(Args)]
+struct OciVerifyArgs {
+    /// Image reference (registry/repo:tag, registry/repo@sha256:..., or oci://...)
+    reference: String,
+
+    /// Output format (auto, sarif, json, table, summary)
+    #[arg(short, long, default_value = "auto")]
+    output: ReportFormat,
+
+    /// Output file path (stdout if not specified)
+    #[arg(short = 'O', long)]
+    output_file: Option<PathBuf>,
+
+    /// Allow plain HTTP / skip registry TLS verification (local registries)
+    #[arg(long)]
+    insecure: bool,
+
+    #[command(flatten)]
+    auth: OciAuthFlags,
+
+    #[command(flatten)]
+    verify: OciVerifyFlags,
+}
+
+/// Arguments for `oci report`.
+#[cfg(feature = "oci")]
+#[derive(Args)]
+struct OciReportArgs {
+    /// Image reference (registry/repo:tag, registry/repo@sha256:..., or oci://...)
+    reference: String,
+
+    /// Output format (auto, json, sarif, markdown, html, table, summary)
+    #[arg(short, long, default_value = "auto")]
+    output: ReportFormat,
+
+    /// Output file path (stdout if not specified)
+    #[arg(short = 'O', long)]
+    output_file: Option<PathBuf>,
+
+    /// Skip OSV/KEV vulnerability enrichment (on by default for `report`)
+    #[arg(long)]
+    no_enrich_vulns: bool,
+
+    /// Also run compliance validation against this standard (cra, ntia, ...)
+    #[arg(long, value_name = "STANDARD")]
+    standard: Option<String>,
+
+    /// Exit non-zero if vulnerabilities are present
+    #[arg(long)]
+    fail_on_vuln: bool,
+
+    /// Exit non-zero on VEX coverage gaps
+    #[arg(long)]
+    fail_on_vex_gap: bool,
+
+    /// Allow plain HTTP / skip registry TLS verification (local registries)
+    #[arg(long)]
+    insecure: bool,
+
+    #[command(flatten)]
+    auth: OciAuthFlags,
+
+    #[command(flatten)]
+    verify: OciVerifyFlags,
 }
 
 /// Sub-subcommands for the `verify` command
@@ -1174,6 +1360,21 @@ fn validate_vex_state(s: &str) -> std::result::Result<String, String> {
             "unknown VEX state: '{s}'. Valid values: \
              not_affected, affected, fixed, under_investigation, none"
         )),
+    }
+}
+
+/// Build [`VerificationInputs`] from the shared `oci` verification flags.
+#[cfg(feature = "oci")]
+fn oci_verification_inputs(v: &OciVerifyFlags) -> VerificationInputs {
+    VerificationInputs {
+        no_verify: v.no_verify,
+        key: v.key.clone(),
+        certificate_identity: v.certificate_identity.clone(),
+        certificate_identity_regexp: v.certificate_identity_regexp.clone(),
+        certificate_oidc_issuer: v.certificate_oidc_issuer.clone(),
+        trust_root: v.trust_root.clone(),
+        rekor_url: v.rekor_url.clone(),
+        insecure_ignore_tlog: v.insecure_ignore_tlog,
     }
 }
 
@@ -1599,6 +1800,90 @@ fn main() -> Result<()> {
             };
 
             let exit_code = cli::run_vex(config, cli_action)?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
+        }
+
+        #[cfg(feature = "oci")]
+        Commands::Oci { action } => {
+            let (cli_action, config) = match action {
+                OciAction::Pull(args) => {
+                    let config = cli::OciCliConfig {
+                        reference: args.reference,
+                        verification: oci_verification_inputs(&args.verify),
+                        registry_token: args.auth.registry_token,
+                        registry_username: args.auth.registry_username,
+                        registry_password: args.auth.registry_password,
+                        output_dir: args.output_dir,
+                        cache_dir: args.cache_dir,
+                        prefer: args.prefer,
+                        insecure: args.insecure,
+                        platform: args.platform,
+                        artifact_kinds: args.artifact,
+                        require_attestations: args.verify.require_attestation,
+                        output_format: ReportFormat::Auto,
+                        output_file: None,
+                        enrich_vulns: false,
+                        standard: None,
+                        fail_on_vuln: false,
+                        fail_on_vex_gap: false,
+                        quiet: cli.quiet,
+                    };
+                    (cli::OciAction::Pull, config)
+                }
+                OciAction::Verify(args) => {
+                    let config = cli::OciCliConfig {
+                        reference: args.reference,
+                        verification: oci_verification_inputs(&args.verify),
+                        registry_token: args.auth.registry_token,
+                        registry_username: args.auth.registry_username,
+                        registry_password: args.auth.registry_password,
+                        output_dir: None,
+                        cache_dir: None,
+                        prefer: "referrers".to_string(),
+                        insecure: args.insecure,
+                        platform: None,
+                        artifact_kinds: Vec::new(),
+                        require_attestations: args.verify.require_attestation,
+                        output_format: args.output,
+                        output_file: args.output_file,
+                        enrich_vulns: false,
+                        standard: None,
+                        fail_on_vuln: false,
+                        fail_on_vex_gap: false,
+                        quiet: cli.quiet,
+                    };
+                    (cli::OciAction::Verify, config)
+                }
+                OciAction::Report(args) => {
+                    let config = cli::OciCliConfig {
+                        reference: args.reference,
+                        verification: oci_verification_inputs(&args.verify),
+                        registry_token: args.auth.registry_token,
+                        registry_username: args.auth.registry_username,
+                        registry_password: args.auth.registry_password,
+                        output_dir: None,
+                        cache_dir: None,
+                        prefer: "referrers".to_string(),
+                        insecure: args.insecure,
+                        platform: None,
+                        artifact_kinds: Vec::new(),
+                        require_attestations: args.verify.require_attestation,
+                        output_format: args.output,
+                        output_file: args.output_file,
+                        enrich_vulns: !args.no_enrich_vulns,
+                        standard: args.standard,
+                        fail_on_vuln: args.fail_on_vuln,
+                        fail_on_vex_gap: args.fail_on_vex_gap,
+                        quiet: cli.quiet,
+                    };
+                    (cli::OciAction::Report, config)
+                }
+            };
+
+            let exit_code = cli::run_oci(config, cli_action)?;
             if exit_code != 0 {
                 std::process::exit(exit_code);
             }

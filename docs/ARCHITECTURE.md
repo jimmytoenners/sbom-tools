@@ -17,7 +17,7 @@ SBOM/CBOM files
 
 ## Core Modules
 
-- **cli** (`src/cli/`): Clap command handlers for diff, view, validate, quality, query, diff-multi, timeline, matrix, watch, enrich, tailor, merge, license-check, verify, vex, completions, and config-schema.
+- **cli** (`src/cli/`): Clap command handlers for diff, view, validate, quality, query, diff-multi, timeline, matrix, watch, enrich, tailor, merge, license-check, verify, vex, oci (feature-gated), completions, and config-schema.
 - **config** (`src/config/`): Typed configuration with YAML/JSON support, presets, validation, and schema generation.
 - **parsers** (`src/parsers/`): CycloneDX/SPDX format detection and parsing into NormalizedSbom. Includes a streaming parser for large files (>512MB) with progress callbacks.
 - **model** (`src/model/`): Canonical data model — NormalizedSbom, Component, CanonicalId, DocumentMetadata, Vulnerability, DependencyEdge, License, CryptoProperties, BomProfile. Includes CycloneDX 1.6/1.7 crypto types (CryptoAssetType, AlgorithmProperties, CertificateProperties, RelatedCryptoMaterialProperties, ProtocolProperties).
@@ -28,6 +28,7 @@ SBOM/CBOM files
   - Custom rule engine for user-defined matching rules.
 - **diff** (`src/diff/`): Semantic diff engine with graph-aware dependency diffing, incremental diff tracking, and cost-model scoring.
 - **enrichment** (`src/enrichment/`): OSV and KEV vulnerability database integration plus EOL detection via endoflife.date API (feature-gated behind `enrichment`). Includes file-based caching with TTL and staleness tracking.
+- **oci** (`src/oci/`): OCI registry ingestion + cosign verification (feature-gated behind `oci`, off by default). Resolves an `OciReference` to verified local SBOM/VEX files for the existing pipeline. The dependency-free layer — reference parsing, verification-policy validation, the public data model — is implemented; the registry client and cosign verification land with the `sigstore` / `oci-client` dependencies. See [`oci-verify-plan.md`](oci-verify-plan.md).
 - **quality** (`src/quality/`): 8-category quality scoring engine with profile-aware weights (Standard, Security, CRA, CBOM, etc.). CBOM profile scores algorithm strength, PQC readiness, OID coverage, crypto completeness, key/cert lifecycle, and cross-reference resolution with hard caps for broken cryptography. Compliance checks against 11 standards: NTIA, FDA, CRA Phase 1/2, NIST SSDF, EO 14028, CNSA 2.0, and NIST PQC (IR 8547).
 - **pipeline** (`src/pipeline/`): Orchestrates the parse → enrich → diff → report workflow. Handles stage sequencing and output routing.
 - **reports** (`src/reports/`): Report generators for JSON, SARIF, HTML, Markdown, CSV, summary, table, and side-by-side formats. Includes a streaming reporter for large outputs.

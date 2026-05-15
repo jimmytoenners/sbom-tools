@@ -68,6 +68,11 @@ schemars = "1.2"
 [features]
 default = ["enrichment"]
 enrichment = ["reqwest"]
+# OCI registry ingestion + cosign verification. Off by default.
+# Dependency wiring (sigstore / oci-client / tokio) lands with the resolver
+# implementation — see docs/oci-verify-plan.md. The skeleton (reference
+# parsing, policy validation, CLI surface) is dependency-free.
+oci = []
 ffi = []
 
 [dev-dependencies]

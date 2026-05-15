@@ -225,6 +225,8 @@ pub mod ffi;
 pub mod license;
 pub mod matching;
 pub mod model;
+#[cfg(feature = "oci")]
+pub mod oci;
 pub mod parsers;
 pub mod pipeline;
 pub mod quality;
@@ -239,7 +241,7 @@ pub mod watch;
 pub use config::{AppConfig, AppConfigBuilder, ConfigPreset, EnrichmentConfig, TuiConfig};
 pub use config::{
     BehaviorConfig, FilterConfig, GraphAwareDiffConfig, MatchingConfig, MatchingRulesPathConfig,
-    OutputConfig,
+    OciConfig, OciVerifyConfig, OutputConfig,
 };
 pub use config::{ConfigError, Validatable};
 pub use config::{
@@ -267,6 +269,13 @@ pub use model::{
     AlgorithmProperties, BomProfile, CanonicalId, CertificateProperties, CipherSuite, Component,
     ComponentSortKey, CryptoAssetType, CryptoProperties, NormalizedSbom, NormalizedSbomIndex,
     ProtocolProperties, RelatedCryptoMaterialProperties, SbomIndexBuilder,
+};
+#[cfg(feature = "oci")]
+pub use oci::{
+    ArtifactFile, ArtifactKind, AttestationVerdict, DiscoveryPreference, DiscoveryScheme,
+    IdentityMatcher, OciError, OciReference, OciResolver, OciResolverConfig,
+    OciVerificationFinding, RekorPolicy, ResolvedArtifacts, SignatureVerdict, TrustRoot,
+    VerificationInputs, VerificationPolicy, VerificationReport,
 };
 pub use parsers::{SbomParser, parse_sbom, parse_sbom_str};
 pub use quality::{QualityGrade, QualityReport, QualityScorer, ScoringProfile};
