@@ -26,6 +26,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::quality::ViolationSeverity;
 
+pub mod attestation;
+
+pub use attestation::{
+    DsseEnvelope, DsseSignature, InTotoStatement, InTotoSubject, classify_predicate,
+    is_known_predicate, parse_dsse_envelope, parse_in_toto_statement, subject_matches_image_digest,
+};
+
 // ============================================================================
 // Errors
 // ============================================================================
@@ -58,6 +65,21 @@ pub enum OciError {
     /// An underlying I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// A serde/JSON parse failure inside the OCI layer — DSSE envelope,
+    /// in-toto Statement, or Referrers index that doesn't match its schema.
+    #[error("parse error: {0}")]
+    Parse(String),
+
+    /// A content digest didn't match its expected value (cache write
+    /// verification, attestation `subject` binding, …).
+    #[error("digest mismatch: expected {expected}, got {actual}")]
+    DigestMismatch {
+        /// The digest we required (`algorithm:hex`).
+        expected: String,
+        /// The digest the data actually hashed to (`algorithm:hex`).
+        actual: String,
+    },
 }
 
 // ============================================================================
