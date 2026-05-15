@@ -52,6 +52,15 @@ clap_mangen = "0.3"
 reqwest = { version = "0.13", features = ["blocking", "json", "rustls"], default-features = false, optional = true }
 sha2 = "0.11"
 
+# OCI registry client (feature-gated). Wraps the registry HTTP dance —
+# manifest pulls, blob pulls, bearer-token auth, Referrers API.
+oci-client = { version = "0.15", default-features = false, features = ["rustls-tls"], optional = true }
+# Current-thread async runtime used at the OCI boundary only; everywhere
+# else in the codebase stays synchronous. `time` + `net` are needed for
+# `Builder::enable_all()` (IO + timer drivers); `fs` + `io-util` give us
+# `tokio::fs::File` + `AsyncWriteExt` for the blob writes.
+tokio = { version = "1", features = ["rt", "time", "net", "fs", "io-util"], optional = true }
+
 # Utilities
 chrono = { version = "0.4.44", features = ["serde"] }
 rayon = "1.12"
@@ -69,10 +78,10 @@ schemars = "1.2"
 default = ["enrichment"]
 enrichment = ["reqwest"]
 # OCI registry ingestion + cosign verification. Off by default.
-# Dependency wiring (sigstore / oci-client / tokio) lands with the resolver
-# implementation — see docs/oci-verify-plan.md. The skeleton (reference
-# parsing, policy validation, CLI surface) is dependency-free.
-oci = []
+# Currently pulls in the registry-fetch deps (oci-client + tokio);
+# cosign verification (sigstore) lands in a follow-up commit — see
+# docs/oci-verify-plan.md.
+oci = ["dep:oci-client", "dep:tokio"]
 ffi = []
 
 [dev-dependencies]

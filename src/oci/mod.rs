@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use crate::quality::ViolationSeverity;
 
 pub mod attestation;
+mod client;
 
 pub use attestation::{
     DsseEnvelope, DsseSignature, InTotoStatement, InTotoSubject, classify_predicate,
@@ -635,22 +636,43 @@ impl Default for OciResolverConfig {
     }
 }
 
-/// Resolves an [`OciReference`] to a set of verified local artifact files.
+/// Registry credentials for [`OciResolver`].
 ///
-/// The fetch + verify implementation lands with the `sigstore` / `oci-client`
-/// dependencies; until then [`OciResolver::resolve`] returns
+/// All three fields are optional; precedence is bearer-token → basic-auth →
+/// anonymous.
+#[derive(Debug, Clone, Default)]
+pub struct AuthInputs {
+    /// Bearer token (e.g. a pre-issued registry token).
+    pub token: Option<String>,
+    /// Basic-auth username.
+    pub username: Option<String>,
+    /// Basic-auth password.
+    pub password: Option<String>,
+}
+
+/// Resolves an [`OciReference`] to a set of local artifact files.
+///
+/// The `--no-verify` path is wired (fetch via OCI Referrers API with cosign
+/// tag-scheme fallback). Cosign verification (sigstore) lands in a follow-up
+/// commit; any other [`VerificationPolicy`] returns
 /// [`OciError::NotImplemented`].
 #[derive(Debug, Clone)]
 pub struct OciResolver {
     policy: VerificationPolicy,
     config: OciResolverConfig,
+    auth: AuthInputs,
 }
 
 impl OciResolver {
-    /// Construct a resolver with a verification policy and run configuration.
+    /// Construct a resolver with a verification policy, run configuration,
+    /// and registry credentials.
     #[must_use]
-    pub const fn new(policy: VerificationPolicy, config: OciResolverConfig) -> Self {
-        Self { policy, config }
+    pub fn new(policy: VerificationPolicy, config: OciResolverConfig, auth: AuthInputs) -> Self {
+        Self {
+            policy,
+            config,
+            auth,
+        }
     }
 
     /// The verification policy this resolver will apply.
@@ -665,19 +687,22 @@ impl OciResolver {
         &self.config
     }
 
-    /// Resolve a reference to verified local artifact files.
+    /// The registry credentials this resolver will use.
+    #[must_use]
+    pub const fn auth(&self) -> &AuthInputs {
+        &self.auth
+    }
+
+    /// Resolve a reference to local artifact files.
     ///
     /// # Errors
     ///
-    /// Currently always returns [`OciError::NotImplemented`] — the registry
-    /// client and cosign verification are pending the `sigstore` /
-    /// `oci-client` dependencies (see `docs/oci-verify-plan.md`, Phases 1–2).
+    /// - [`OciError::NotImplemented`] if the policy is anything other than
+    ///   [`VerificationPolicy::None`] (cosign verification not yet wired).
+    /// - [`OciError::InvalidReference`] / [`OciError::Registry`] /
+    ///   [`OciError::Io`] for fetch failures.
     pub fn resolve(&self, reference: &OciReference) -> Result<ResolvedArtifacts, OciError> {
-        Err(OciError::NotImplemented(format!(
-            "registry fetch + cosign verification for `{reference}` is not wired yet \
-             — the resolver internals land with the sigstore / oci-client \
-             dependencies (see docs/oci-verify-plan.md)"
-        )))
+        client::fetch_artifacts(reference, &self.auth, &self.policy, &self.config)
     }
 }
 
@@ -950,16 +975,41 @@ mod tests {
         ));
     }
 
-    // ---- resolver stub -----------------------------------------------------
+    // ---- resolver ----------------------------------------------------------
 
     #[test]
-    fn resolver_resolve_is_not_implemented_yet() {
-        let resolver = OciResolver::new(VerificationPolicy::None, OciResolverConfig::default());
+    fn resolver_returns_not_implemented_for_verification_policies() {
+        // Verification policies (key-based / keyless) aren't wired yet; the
+        // resolver must reject them with NotImplemented rather than silently
+        // fetching without verifying. Network is *not* contacted on this
+        // path so the test is hermetic.
+        let resolver = OciResolver::new(
+            VerificationPolicy::KeyBased {
+                key_path: PathBuf::from("cosign.pub"),
+            },
+            OciResolverConfig::default(),
+            AuthInputs::default(),
+        );
         let reference = OciReference::parse("ghcr.io/acme/api:v1").unwrap();
         assert!(matches!(
             resolver.resolve(&reference),
             Err(OciError::NotImplemented(_))
         ));
+    }
+
+    #[test]
+    fn resolver_exposes_auth() {
+        let auth = AuthInputs {
+            username: Some("u".into()),
+            password: Some("p".into()),
+            token: None,
+        };
+        let resolver = OciResolver::new(
+            VerificationPolicy::None,
+            OciResolverConfig::default(),
+            auth.clone(),
+        );
+        assert_eq!(resolver.auth().username.as_deref(), Some("u"));
     }
 
     #[test]

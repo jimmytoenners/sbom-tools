@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 
 use crate::oci::{
-    ArtifactKind, DiscoveryPreference, OciReference, OciResolver, OciResolverConfig,
+    ArtifactKind, AuthInputs, DiscoveryPreference, OciReference, OciResolver, OciResolverConfig,
     VerificationInputs, VerificationPolicy,
 };
 use crate::pipeline::exit_codes;
@@ -97,19 +97,19 @@ pub struct OciCliConfig {
 /// # Errors
 ///
 /// Returns an error if the image reference is malformed or the verification
-/// flags do not form a coherent policy. A successful *parse* still exits with
-/// [`exit_codes::ERROR`] for now, because the registry fetch + verification
-/// internals are not wired yet (see `docs/oci-verify-plan.md`).
+/// flags do not form a coherent policy. Fetch/registry errors surface as a
+/// non-zero exit code rather than an anyhow error so the caller can route
+/// them through the standard CI flow.
 pub fn run_oci(config: OciCliConfig, action: OciAction) -> Result<i32> {
-    // 1. Parse the image reference (dependency-free, fully implemented).
+    // 1. Parse the image reference.
     let reference = OciReference::parse(&config.reference)
         .map_err(|e| anyhow::anyhow!("invalid image reference: {e}"))?;
 
-    // 2. Validate the verification policy (dependency-free, fully implemented).
+    // 2. Validate the verification policy.
     let policy = VerificationPolicy::from_inputs(&config.verification)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // 3. Assemble the resolver configuration.
+    // 3. Assemble the resolver configuration + auth.
     let resolver_config = OciResolverConfig {
         cache_dir: config.cache_dir.clone(),
         output_dir: config.output_dir.clone(),
@@ -119,18 +119,25 @@ pub fn run_oci(config: OciCliConfig, action: OciAction) -> Result<i32> {
         artifact_kinds: parse_artifact_kinds(&config.artifact_kinds)?,
         require_attestations: config.require_attestations.clone(),
     };
-    let resolver = OciResolver::new(policy.clone(), resolver_config);
+    let auth = AuthInputs {
+        token: config.registry_token.clone(),
+        username: config.registry_username.clone(),
+        password: config.registry_password.clone(),
+    };
+    let resolver = OciResolver::new(policy.clone(), resolver_config, auth);
 
-    // 4. Report what the (dependency-free) layer resolved.
+    // 4. Show what's about to happen.
     if !config.quiet {
-        print_scaffold_status(action, &reference, &policy, &resolver, &config);
+        print_run_intent(action, &reference, &policy, &resolver, &config);
     }
 
-    // 5. Attempt resolution — currently returns NotImplemented.
+    // 5. Run the resolver. With `--no-verify` this actually fetches; with
+    // verification policies it returns NotImplemented until sigstore lands.
     match resolver.resolve(&reference) {
-        Ok(_resolved) => {
-            // Unreachable until the resolver internals land; kept so the
-            // happy path compiles and is obvious to the next implementer.
+        Ok(resolved) => {
+            if !config.quiet {
+                print_resolved(&resolved);
+            }
             Ok(exit_codes::SUCCESS)
         }
         Err(e) => {
@@ -180,19 +187,30 @@ fn push_unique(out: &mut Vec<ArtifactKind>, kind: ArtifactKind) {
     }
 }
 
-/// Print the parsed reference + validated policy so the dependency-free layer
-/// is demonstrably working end-to-end while the resolver is being built.
-fn print_scaffold_status(
+/// Print what the `oci` invocation is about to do — parsed reference,
+/// resolved policy, discovery preference, output destination. With
+/// `--no-verify` this is followed by an actual fetch; with a verification
+/// policy the resolver currently returns `NotImplemented` until sigstore
+/// lands.
+fn print_run_intent(
     action: OciAction,
     reference: &OciReference,
     policy: &VerificationPolicy,
     resolver: &OciResolver,
     config: &OciCliConfig,
 ) {
-    println!(
-        "oci {} (scaffolded — registry fetch + verification pending)",
-        action.label()
-    );
+    let title = if matches!(policy, VerificationPolicy::None) {
+        format!(
+            "oci {} (fetching — verification disabled via --no-verify)",
+            action.label()
+        )
+    } else {
+        format!(
+            "oci {} (cosign verification not yet wired — see docs/oci-verify-plan.md)",
+            action.label()
+        )
+    };
+    println!("{title}");
     println!("  reference:   {reference}");
     println!("    registry   {}", reference.registry);
     println!("    repository {}", reference.repository);
@@ -235,6 +253,36 @@ fn print_scaffold_status(
                 .map(|s| format!(", standard={s}"))
                 .unwrap_or_default()
         );
+    }
+}
+
+/// Print the artifacts the resolver materialised, post-fetch.
+fn print_resolved(resolved: &crate::oci::ResolvedArtifacts) {
+    println!();
+    println!("resolved image digest: {}", resolved.image_digest);
+    println!("  sboms ({}):", resolved.sboms.len());
+    for af in &resolved.sboms {
+        println!(
+            "    - {} ({}, via {:?})",
+            af.path.display(),
+            af.media_type,
+            af.discovered_via
+        );
+    }
+    println!("  vex   ({}):", resolved.vex_docs.len());
+    for af in &resolved.vex_docs {
+        println!(
+            "    - {} ({}, via {:?})",
+            af.path.display(),
+            af.media_type,
+            af.discovered_via
+        );
+    }
+    if matches!(
+        resolved.verification.image_signature,
+        crate::oci::SignatureVerdict::Skipped
+    ) {
+        println!("  verification: skipped (--no-verify)");
     }
 }
 
@@ -286,10 +334,14 @@ mod tests {
     }
 
     fn base_config() -> OciCliConfig {
+        // Default uses a key-based policy so resolver tests stay hermetic —
+        // verification isn't wired yet, so resolve() returns NotImplemented
+        // without touching the network. Tests that need a different policy
+        // override the verification field.
         OciCliConfig {
             reference: "ghcr.io/acme/api:v1".to_string(),
             verification: VerificationInputs {
-                no_verify: true,
+                key: Some(PathBuf::from("cosign.pub")),
                 rekor_url: "https://rekor.sigstore.dev".to_string(),
                 ..Default::default()
             },
@@ -314,7 +366,9 @@ mod tests {
     }
 
     #[test]
-    fn run_oci_exits_error_until_resolver_is_wired() {
+    fn run_oci_returns_error_for_unwired_verification_policy() {
+        // Key-based verification is gated on sigstore — the resolver returns
+        // NotImplemented, which the handler reports as exit code ERROR.
         let code = run_oci(base_config(), OciAction::Pull).unwrap();
         assert_eq!(code, exit_codes::ERROR);
     }
@@ -331,7 +385,9 @@ mod tests {
         let mut config = base_config();
         // --no-verify combined with a key is a contradiction.
         config.verification.no_verify = true;
-        config.verification.key = Some(PathBuf::from("cosign.pub"));
+        // base_config already sets `key`; adding no_verify makes it
+        // incoherent and policy validation must reject it before the
+        // resolver runs.
         assert!(run_oci(config, OciAction::Verify).is_err());
     }
 }

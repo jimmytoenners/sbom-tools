@@ -272,8 +272,8 @@ pub use model::{
 };
 #[cfg(feature = "oci")]
 pub use oci::{
-    ArtifactFile, ArtifactKind, AttestationVerdict, DiscoveryPreference, DiscoveryScheme,
-    IdentityMatcher, OciError, OciReference, OciResolver, OciResolverConfig,
+    ArtifactFile, ArtifactKind, AttestationVerdict, AuthInputs, DiscoveryPreference,
+    DiscoveryScheme, IdentityMatcher, OciError, OciReference, OciResolver, OciResolverConfig,
     OciVerificationFinding, RekorPolicy, ResolvedArtifacts, SignatureVerdict, TrustRoot,
     VerificationInputs, VerificationPolicy, VerificationReport,
 };
