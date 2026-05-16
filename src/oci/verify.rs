@@ -27,17 +27,18 @@
 //! Keyless attestations: the resolver captures each cosign attestation
 //! layer's `dev.sigstore.cosign/certificate` annotation as a sidecar
 //! (`<kind>-<short>.cert.pem`). The verifier parses it with `x509-cert`,
-//! extracts the SAN via `sigstore::cosign::signature_layers::CertificateSubject`,
+//! validates the cert chain against the bundled Fulcio CAs (issuer DN
+//! match + signature verification + validity-period check), extracts the
+//! SAN via `sigstore::cosign::signature_layers::CertificateSubject`,
 //! extracts the Fulcio OIDC-issuer extension (OID `1.3.6.1.4.1.57264.1.1`),
 //! matches both against the policy, derives a `CosignVerificationKey` from
 //! the cert's `SubjectPublicKeyInfo`, and verifies the DSSE signatures over
 //! PAE. Digest binding (`subject.digest` against the resolved image digest)
 //! is always computed.
 //!
-//! **v1 limitation:** the per-attestation cert chain is NOT validated
-//! against Fulcio in this pass. The keyless image-signature path *is*
-//! Fulcio-chain-validated by sigstore-rs, so that remains the trust
-//! anchor; closing the per-attestation chain gap is the obvious follow-up.
+//! Rekor inclusion verification per attestation is still deferred — the
+//! image-signature path is Rekor-validated by sigstore-rs, which is the
+//! strongest publisher trust anchor.
 
 use std::path::Path;
 
@@ -50,10 +51,11 @@ use sigstore::cosign::{ClientBuilder, CosignCapabilities, verify_constraints};
 use sigstore::crypto::{CosignVerificationKey, Signature};
 use sigstore::errors::SigstoreError;
 use sigstore::registry::{Auth as SigstoreAuth, OciReference as SigstoreOciRef};
+use sigstore::trust::TrustRoot as SigstoreTrustRootTrait;
 use sigstore::trust::sigstore::SigstoreTrustRoot;
 use tokio::runtime::Runtime;
 use x509_cert::Certificate as X509Certificate;
-use x509_cert::der::DecodePem;
+use x509_cert::der::{Decode, DecodePem, Encode};
 
 use crate::quality::ViolationSeverity;
 
@@ -427,7 +429,33 @@ fn verify_keyless(
         findings: Vec::new(),
     };
 
-    // 1. Image signature via sigstore-rs's cosign Client + Sigstore trust root.
+    // Fetch the Sigstore trust root once (cached on disk after the first
+    // call). It's used twice: by sigstore-rs's cosign Client for the image
+    // signature path, and by our own per-attestation chain validator.
+    let cache_dir = crate::pipeline::dirs::cache_dir().map(|d| d.join("sigstore-tuf"));
+    if let Some(ref dir) = cache_dir {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let trust_root_result = runtime.block_on(SigstoreTrustRoot::new(cache_dir.as_deref()));
+    let trust_root = match trust_root_result {
+        Ok(t) => t,
+        Err(e) => {
+            let msg = format!("fetch Sigstore TUF root: {e}");
+            report.image_signature = SignatureVerdict::Failed(msg.clone());
+            report.findings.push(OciVerificationFinding {
+                rule_id: "SBOM-OCI-SIG-002".to_string(),
+                severity: ViolationSeverity::Error,
+                message: format!("Keyless image signature verification failed: {msg}"),
+            });
+            return Ok(report);
+        }
+    };
+    let fulcio_cert_bytes: Vec<Vec<u8>> = trust_root
+        .fulcio_certs()
+        .map(|certs| certs.into_iter().map(|c| c.as_ref().to_vec()).collect())
+        .unwrap_or_default();
+
+    // 1. Image signature via sigstore-rs's cosign Client.
     report.image_signature = verify_keyless_image_signature(
         runtime,
         reference,
@@ -435,6 +463,7 @@ fn verify_keyless(
         auth,
         identity_match,
         oidc_issuer,
+        &trust_root,
     )?;
     if let SignatureVerdict::Failed(ref msg) = report.image_signature {
         report.findings.push(OciVerificationFinding {
@@ -447,7 +476,9 @@ fn verify_keyless(
     // 2. Attestation envelopes — keyless DSSE signature verification using
     // the per-envelope ephemeral cert that the fetcher captured as a
     // sidecar (`<kind>-<short>.cert.pem`, from the cosign
-    // `dev.sigstore.cosign/certificate` layer annotation).
+    // `dev.sigstore.cosign/certificate` layer annotation). The leaf cert
+    // is chain-validated against the bundled Fulcio CAs we just pulled
+    // from the trust root.
     let identity_match_for_atts = IdentityMatch::from_policy(identity)?;
     for envelope_path in envelope_paths {
         let verdict = verify_attestation_keyless(
@@ -455,6 +486,7 @@ fn verify_keyless(
             image_digest,
             &identity_match_for_atts,
             oidc_issuer,
+            &fulcio_cert_bytes,
         );
         if let SignatureVerdict::Failed(ref msg) = verdict.verdict {
             report.findings.push(OciVerificationFinding {
@@ -509,6 +541,7 @@ fn verify_attestation_keyless(
     image_digest: &str,
     identity: &IdentityMatch,
     oidc_issuer: &str,
+    fulcio_cert_bytes: &[Vec<u8>],
 ) -> AttestationVerdict {
     let mut verdict = AttestationVerdict {
         predicate_type: None,
@@ -625,6 +658,16 @@ fn verify_attestation_keyless(
         }
     }
 
+    // Chain validation: the leaf cert must be signed by one of the bundled
+    // Fulcio CAs from the trust root. Without this, an attacker who knows
+    // the policy could craft a self-signed cert claiming the right SAN and
+    // sign a tampered DSSE envelope — chain validation is what makes the
+    // identity claim trustworthy.
+    if let Err(e) = verify_cert_chain_to_fulcio(&cert, fulcio_cert_bytes) {
+        verdict.verdict = SignatureVerdict::Failed(format!("Fulcio chain validation failed: {e}"));
+        return verdict;
+    }
+
     // Verify each DSSE signature against the cert's public key.
     let key = match CosignVerificationKey::try_from(&cert.tbs_certificate.subject_public_key_info) {
         Ok(k) => k,
@@ -677,28 +720,17 @@ fn verify_keyless_image_signature(
     auth: &AuthInputs,
     identity_match: IdentityMatch,
     oidc_issuer: &str,
+    trust_root: &SigstoreTrustRoot,
 ) -> Result<SignatureVerdict, OciError> {
     let sigstore_auth = to_sigstore_auth(auth);
     let sigstore_ref: SigstoreOciRef = reference.to_string().parse().map_err(|e| {
         OciError::InvalidReference(format!("sigstore cannot parse `{reference}`: {e}"))
     })?;
     let oidc_issuer = oidc_issuer.to_string();
-    // First run fetches the Sigstore TUF root over the network; subsequent
-    // runs reuse the cache. Ensure the directory exists so the underlying
-    // tough library can write to it.
-    let cache_dir = crate::pipeline::dirs::cache_dir().map(|d| d.join("sigstore-tuf"));
-    if let Some(ref dir) = cache_dir {
-        let _ = std::fs::create_dir_all(dir);
-    }
 
-    let outcome = runtime.block_on(async move {
-        // Bundled Sigstore public-good TUF root. First run hits the network
-        // to fetch the trusted_root.json; subsequent runs reuse the cache.
-        let trust_root = SigstoreTrustRoot::new(cache_dir.as_deref())
-            .await
-            .map_err(|e| format!("fetch Sigstore TUF root: {e}"))?;
+    let outcome = runtime.block_on(async {
         let mut client = ClientBuilder::default()
-            .with_trust_repository(&trust_root)
+            .with_trust_repository(trust_root)
             .map_err(|e| format!("trust repository: {e}"))?
             .build()
             .map_err(|e| format!("sigstore client build: {e}"))?;
@@ -731,6 +763,92 @@ fn verify_keyless_image_signature(
         Ok(_) => SignatureVerdict::Verified,
         Err(msg) => SignatureVerdict::Failed(msg),
     })
+}
+
+/// Verify a leaf x509 cert is signed by one of the trusted Fulcio CAs
+/// (i.e. the cert chain has length 2: leaf → trusted CA).
+///
+/// Real-world Fulcio uses a 3-cert chain (leaf → intermediate → root)
+/// where the intermediate IS what's bundled in `SigstoreTrustRoot::fulcio_certs()`.
+/// So one verification step against the bundled CAs is sufficient.
+///
+/// Returns `Ok(())` if the leaf is signed by any of `fulcio_cert_bytes`
+/// AND the leaf is within its validity period.
+fn verify_cert_chain_to_fulcio(
+    leaf: &X509Certificate,
+    fulcio_cert_bytes: &[Vec<u8>],
+) -> Result<(), String> {
+    if fulcio_cert_bytes.is_empty() {
+        return Err("no Fulcio CAs available for chain validation".to_string());
+    }
+
+    let leaf_tbs_der = leaf
+        .tbs_certificate
+        .to_der()
+        .map_err(|e| format!("encode tbsCertificate: {e}"))?;
+    let sig_bytes = leaf.signature.raw_bytes();
+
+    let mut tried = 0usize;
+    for ca_der in fulcio_cert_bytes {
+        let Ok(ca) = X509Certificate::from_der(ca_der) else {
+            continue;
+        };
+        // Issuer DN of the leaf must match Subject DN of the candidate CA.
+        if ca.tbs_certificate.subject != leaf.tbs_certificate.issuer {
+            continue;
+        }
+        tried += 1;
+        let Ok(ca_key) =
+            CosignVerificationKey::try_from(&ca.tbs_certificate.subject_public_key_info)
+        else {
+            continue;
+        };
+        if ca_key
+            .verify_signature(Signature::Raw(sig_bytes), &leaf_tbs_der)
+            .is_ok()
+        {
+            return check_cert_validity(leaf);
+        }
+    }
+
+    if tried == 0 {
+        Err(format!(
+            "no Fulcio CA in the trust root issued this cert (issuer DN unmatched, \
+             {} CA(s) checked)",
+            fulcio_cert_bytes.len()
+        ))
+    } else {
+        Err(format!(
+            "Fulcio chain validation failed: cert signature didn't verify against \
+             any of {tried} candidate CA(s) with matching subject DN"
+        ))
+    }
+}
+
+/// Reject a cert that's outside its `notBefore` / `notAfter` window.
+fn check_cert_validity(cert: &X509Certificate) -> Result<(), String> {
+    let now = chrono::Utc::now().timestamp();
+    let not_before = cert
+        .tbs_certificate
+        .validity
+        .not_before
+        .to_unix_duration()
+        .as_secs() as i64;
+    let not_after = cert
+        .tbs_certificate
+        .validity
+        .not_after
+        .to_unix_duration()
+        .as_secs() as i64;
+    if now < not_before {
+        return Err(format!(
+            "cert not yet valid (notBefore {not_before} > now {now})"
+        ));
+    }
+    if now > not_after {
+        return Err(format!("cert expired (notAfter {not_after} < now {now})"));
+    }
+    Ok(())
 }
 
 /// DSSE Pre-Authentication Encoding (RFC: secure-systems-lab/dsse v1.0).
