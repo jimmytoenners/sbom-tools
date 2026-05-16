@@ -28,6 +28,7 @@ use crate::quality::ViolationSeverity;
 
 pub mod attestation;
 mod client;
+mod verify;
 
 pub use attestation::{
     DsseEnvelope, DsseSignature, InTotoStatement, InTotoSubject, classify_predicate,
@@ -979,14 +980,18 @@ mod tests {
     // ---- resolver ----------------------------------------------------------
 
     #[test]
-    fn resolver_returns_not_implemented_for_verification_policies() {
-        // Verification policies (key-based / keyless) aren't wired yet; the
-        // resolver must reject them with NotImplemented rather than silently
-        // fetching without verifying. Network is *not* contacted on this
-        // path so the test is hermetic.
+    fn resolver_returns_not_implemented_for_keyless() {
+        // Keyless verification (Fulcio + Rekor + identity matching) is the
+        // next increment and must reject up front. Key-based now goes
+        // through fetch + sigstore, so it isn't covered here. Hermetic —
+        // no network is touched because the keyless branch errors before
+        // the fetch begins.
         let resolver = OciResolver::new(
-            VerificationPolicy::KeyBased {
-                key_path: PathBuf::from("cosign.pub"),
+            VerificationPolicy::Keyless {
+                identity: IdentityMatcher::Exact("x".to_string()),
+                oidc_issuer: "https://issuer".to_string(),
+                trust_root: TrustRoot::BundledPublicGood,
+                rekor: RekorPolicy::IgnoreTlog,
             },
             OciResolverConfig::default(),
             AuthInputs::default(),

@@ -148,7 +148,22 @@ pub fn run_oci(config: OciCliConfig, action: OciAction) -> Result<i32> {
         print_resolved(&resolved);
     }
 
-    // 6. For `oci report`, additionally parse, enrich, apply VEX, and emit
+    // 6. Verification gate — when a policy was active, any failed signature
+    // or digest-binding mismatch short-circuits with exit code 6. The
+    // artifacts stay on disk so an operator can inspect them; the failure
+    // is loud and the exit code matches the proposal's contract.
+    if !matches!(policy, VerificationPolicy::None) && !resolved.verification.passed() {
+        if !config.quiet {
+            eprintln!();
+            eprintln!("oci {}: verification failed", action.label());
+            for finding in &resolved.verification.findings {
+                eprintln!("  [{}] {}", finding.rule_id, finding.message);
+            }
+        }
+        return Ok(exit_codes::OCI_VERIFICATION_FAILED);
+    }
+
+    // 7. For `oci report`, additionally parse, enrich, apply VEX, and emit
     // the vulnerability picture.
     if matches!(action, OciAction::Report) {
         return run_report_pipeline(&resolved, &config);
@@ -198,9 +213,9 @@ fn push_unique(out: &mut Vec<ArtifactKind>, kind: ArtifactKind) {
 
 /// Print what the `oci` invocation is about to do — parsed reference,
 /// resolved policy, discovery preference, output destination. With
-/// `--no-verify` this is followed by an actual fetch; with a verification
-/// policy the resolver currently returns `NotImplemented` until sigstore
-/// lands.
+/// `--no-verify` this is followed by a fetch only; with a key-based policy
+/// the resolver also runs cosign signature + DSSE envelope verification.
+/// Keyless policies still return `NotImplemented` (next increment).
 fn print_run_intent(
     action: OciAction,
     reference: &OciReference,
@@ -208,16 +223,21 @@ fn print_run_intent(
     resolver: &OciResolver,
     config: &OciCliConfig,
 ) {
-    let title = if matches!(policy, VerificationPolicy::None) {
-        format!(
+    let title = match policy {
+        VerificationPolicy::None => format!(
             "oci {} (fetching — verification disabled via --no-verify)",
             action.label()
-        )
-    } else {
-        format!(
-            "oci {} (cosign verification not yet wired — see docs/oci-verify-plan.md)",
+        ),
+        VerificationPolicy::KeyBased { .. } => {
+            format!(
+                "oci {} (fetching + key-based cosign verification)",
+                action.label()
+            )
+        }
+        VerificationPolicy::Keyless { .. } => format!(
+            "oci {} (keyless verification — not yet wired, will exit 3)",
             action.label()
-        )
+        ),
     };
     println!("{title}");
     println!("  reference:   {reference}");
@@ -287,11 +307,32 @@ fn print_resolved(resolved: &crate::oci::ResolvedArtifacts) {
             af.discovered_via
         );
     }
-    if matches!(
-        resolved.verification.image_signature,
-        crate::oci::SignatureVerdict::Skipped
-    ) {
-        println!("  verification: skipped (--no-verify)");
+    match &resolved.verification.image_signature {
+        crate::oci::SignatureVerdict::Skipped => {
+            println!("  verification: skipped (--no-verify)");
+        }
+        crate::oci::SignatureVerdict::Verified => {
+            println!("  verification: image signature OK");
+        }
+        crate::oci::SignatureVerdict::Failed(msg) => {
+            println!("  verification: image signature FAILED ({msg})");
+        }
+    }
+    if !resolved.verification.attestations.is_empty() {
+        let verified = resolved
+            .verification
+            .attestations
+            .iter()
+            .filter(|a| matches!(a.verdict, crate::oci::SignatureVerdict::Verified))
+            .count();
+        let failed = resolved
+            .verification
+            .attestations
+            .iter()
+            .filter(|a| matches!(a.verdict, crate::oci::SignatureVerdict::Failed(_)))
+            .count();
+        let total = resolved.verification.attestations.len();
+        println!("  attestations: {verified}/{total} verified, {failed} failed");
     }
 }
 

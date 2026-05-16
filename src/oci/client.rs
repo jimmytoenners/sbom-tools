@@ -28,7 +28,7 @@ use tokio::runtime::{Builder, Runtime};
 
 use super::{
     ArtifactFile, ArtifactKind, AuthInputs, DiscoveryScheme, OciError, OciReference,
-    OciResolverConfig, ResolvedArtifacts, SignatureVerdict, VerificationPolicy, VerificationReport,
+    OciResolverConfig, ResolvedArtifacts, VerificationPolicy,
 };
 
 // ============================================================================
@@ -71,10 +71,12 @@ pub fn fetch_artifacts(
     policy: &VerificationPolicy,
     config: &OciResolverConfig,
 ) -> Result<ResolvedArtifacts, OciError> {
-    if !matches!(policy, VerificationPolicy::None) {
+    // Fail fast before any network IO if the policy isn't yet supported.
+    if matches!(policy, VerificationPolicy::Keyless { .. }) {
         return Err(OciError::NotImplemented(
-            "cosign verification (sigstore) is not yet wired — re-run with --no-verify \
-             to fetch without verifying"
+            "keyless cosign verification (Fulcio + Rekor + identity matching) \
+             is the next increment — re-run with --key for key-based verification \
+             or --no-verify to fetch only"
                 .to_string(),
         ));
     }
@@ -167,18 +169,47 @@ pub fn fetch_artifacts(
         );
     }
 
+    // --- Verification ------------------------------------------------------
+    // With `--no-verify`, this returns a Skipped report. Otherwise it
+    // verifies the image signature and every DSSE envelope on disk.
+    let envelope_paths = list_envelope_files(&output_dir);
+    let verification = super::verify::verify_image(
+        &runtime,
+        reference,
+        &image_digest,
+        auth,
+        policy,
+        &envelope_paths,
+    )?;
+
     Ok(ResolvedArtifacts {
         image_digest,
         sboms,
         vex_docs,
-        verification: VerificationReport {
-            image_signature: SignatureVerdict::Skipped,
-            attestations: Vec::new(),
-            // Verification deferred; with --no-verify we don't claim binding.
-            digest_binding_ok: true,
-            findings: Vec::new(),
-        },
+        verification,
     })
+}
+
+/// Find every `*.dsse.json` file in `dir` (one per attestation envelope the
+/// resolver materialised). These are the inputs to `verify::verify_image`'s
+/// per-envelope verification pass.
+fn list_envelope_files(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(".dsse.json"))
+        {
+            out.push(path);
+        }
+    }
+    out.sort();
+    out
 }
 
 // ============================================================================
@@ -735,14 +766,19 @@ mod tests {
     }
 
     #[test]
-    fn fetch_rejects_non_no_verify_policy() {
-        let reference = OciReference::parse("ghcr.io/x/y:v1").unwrap();
-        let auth = AuthInputs::default();
-        let policy = VerificationPolicy::KeyBased {
-            key_path: PathBuf::from("cosign.pub"),
-        };
-        let cfg = OciResolverConfig::default();
-        let err = fetch_artifacts(&reference, &auth, &policy, &cfg).unwrap_err();
-        assert!(matches!(err, OciError::NotImplemented(_)));
+    fn list_envelope_files_finds_only_dsse() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = dir.path().join("sbom-abc.dsse.json");
+        let p2 = dir.path().join("sbom-abc.cdx.json");
+        let p3 = dir.path().join("vex-def.dsse.json");
+        let p4 = dir.path().join("other.txt");
+        for p in [&p1, &p2, &p3, &p4] {
+            std::fs::File::create(p).unwrap().write_all(b"{}").unwrap();
+        }
+        let envelopes = list_envelope_files(dir.path());
+        assert_eq!(envelopes.len(), 2);
+        assert!(envelopes.iter().any(|p| p == &p1));
+        assert!(envelopes.iter().any(|p| p == &p3));
     }
 }
