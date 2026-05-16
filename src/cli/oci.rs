@@ -235,7 +235,7 @@ fn print_run_intent(
             )
         }
         VerificationPolicy::Keyless { .. } => format!(
-            "oci {} (keyless verification — not yet wired, will exit 3)",
+            "oci {} (fetching + keyless cosign verification — Fulcio + Rekor)",
             action.label()
         ),
     };

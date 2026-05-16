@@ -71,16 +71,6 @@ pub fn fetch_artifacts(
     policy: &VerificationPolicy,
     config: &OciResolverConfig,
 ) -> Result<ResolvedArtifacts, OciError> {
-    // Fail fast before any network IO if the policy isn't yet supported.
-    if matches!(policy, VerificationPolicy::Keyless { .. }) {
-        return Err(OciError::NotImplemented(
-            "keyless cosign verification (Fulcio + Rekor + identity matching) \
-             is the next increment — re-run with --key for key-based verification \
-             or --no-verify to fetch only"
-                .to_string(),
-        ));
-    }
-
     let runtime = Builder::new_current_thread()
         .enable_all()
         .build()

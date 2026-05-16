@@ -979,29 +979,10 @@ mod tests {
 
     // ---- resolver ----------------------------------------------------------
 
-    #[test]
-    fn resolver_returns_not_implemented_for_keyless() {
-        // Keyless verification (Fulcio + Rekor + identity matching) is the
-        // next increment and must reject up front. Key-based now goes
-        // through fetch + sigstore, so it isn't covered here. Hermetic —
-        // no network is touched because the keyless branch errors before
-        // the fetch begins.
-        let resolver = OciResolver::new(
-            VerificationPolicy::Keyless {
-                identity: IdentityMatcher::Exact("x".to_string()),
-                oidc_issuer: "https://issuer".to_string(),
-                trust_root: TrustRoot::BundledPublicGood,
-                rekor: RekorPolicy::IgnoreTlog,
-            },
-            OciResolverConfig::default(),
-            AuthInputs::default(),
-        );
-        let reference = OciReference::parse("ghcr.io/acme/api:v1").unwrap();
-        assert!(matches!(
-            resolver.resolve(&reference),
-            Err(OciError::NotImplemented(_))
-        ));
-    }
+    // Note: both KeyBased and Keyless policies now drive real fetch + verify
+    // flows through the network; there's no hermetic resolve() path that
+    // returns NotImplemented up front for them. Policy-validation tests
+    // (regex parsing, --trust-root custom, etc.) live in `verify::tests`.
 
     #[test]
     fn resolver_exposes_auth() {

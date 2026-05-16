@@ -16,24 +16,39 @@
 //!
 //! # Scope
 //!
-//! Key-based verification only. Keyless (Fulcio + Rekor + OIDC identity
-//! matching) is the next increment and returns
-//! [`OciError::NotImplemented`] today.
+//! Key-based and keyless verification of the **image signature** are both
+//! wired. Keyless validates the Fulcio cert chain, requires Rekor
+//! transparency-log inclusion (via the bundled Sigstore public-good TUF
+//! root), and matches the cert SAN + OIDC issuer against the configured
+//! policy (exact or regex).
+//!
+//! Per-attestation DSSE signature verification is fully wired for key-based;
+//! keyless DSSE verification (which needs each attestation's ephemeral cert
+//! out of the cosign attestation manifest annotations) is the next
+//! increment. Until that lands, keyless attestations are reported as
+//! `Skipped` for the signature verdict, but their in-toto subject digest is
+//! still matched against the image digest so a mismatched SBOM is caught.
 
 use std::path::Path;
 
 use base64::Engine;
-use sigstore::cosign::verification_constraint::{PublicKeyVerifier, VerificationConstraintVec};
+use sigstore::cosign::signature_layers::{CertificateSubject, SignatureLayer};
+use sigstore::cosign::verification_constraint::{
+    PublicKeyVerifier, VerificationConstraint, VerificationConstraintVec,
+};
 use sigstore::cosign::{ClientBuilder, CosignCapabilities, verify_constraints};
 use sigstore::crypto::{CosignVerificationKey, Signature};
+use sigstore::errors::SigstoreError;
 use sigstore::registry::{Auth as SigstoreAuth, OciReference as SigstoreOciRef};
+use sigstore::trust::sigstore::SigstoreTrustRoot;
 use tokio::runtime::Runtime;
 
 use crate::quality::ViolationSeverity;
 
 use super::{
-    AttestationVerdict, AuthInputs, OciError, OciReference, OciVerificationFinding,
-    SignatureVerdict, VerificationPolicy, VerificationReport,
+    AttestationVerdict, AuthInputs, IdentityMatcher, OciError, OciReference,
+    OciVerificationFinding, RekorPolicy, SignatureVerdict, TrustRoot, VerificationPolicy,
+    VerificationReport,
     attestation::{parse_dsse_envelope, parse_in_toto_statement, subject_matches_image_digest},
 };
 
@@ -74,12 +89,22 @@ pub fn verify_image(
                 envelope_paths,
             )
         }
-        VerificationPolicy::Keyless { .. } => Err(OciError::NotImplemented(
-            "keyless cosign verification (Fulcio + Rekor + identity matching) \
-             is the next increment — re-run with --key for key-based verification \
-             or --no-verify to fetch only"
-                .to_string(),
-        )),
+        VerificationPolicy::Keyless {
+            identity,
+            oidc_issuer,
+            trust_root,
+            rekor,
+        } => verify_keyless(
+            runtime,
+            reference,
+            image_digest,
+            auth,
+            identity,
+            oidc_issuer,
+            trust_root,
+            rekor,
+            envelope_paths,
+        ),
     }
 }
 
@@ -292,6 +317,224 @@ fn verify_envelope_file(
     verdict
 }
 
+// ============================================================================
+// Keyless verification
+// ============================================================================
+
+/// Pre-compiled identity matcher — exact string or regex.
+#[derive(Debug, Clone)]
+enum IdentityMatch {
+    Exact(String),
+    Regex(regex::Regex),
+}
+
+impl IdentityMatch {
+    fn from_policy(matcher: &IdentityMatcher) -> Result<Self, OciError> {
+        Ok(match matcher {
+            IdentityMatcher::Exact(s) => Self::Exact(s.clone()),
+            IdentityMatcher::Regexp(pattern) => {
+                Self::Regex(regex::Regex::new(pattern).map_err(|e| {
+                    OciError::InvalidPolicy(format!(
+                        "--certificate-identity-regexp `{pattern}` is not a valid regex: {e}"
+                    ))
+                })?)
+            }
+        })
+    }
+    fn matches(&self, subject: &str) -> bool {
+        match self {
+            Self::Exact(s) => subject == s.as_str(),
+            Self::Regex(r) => r.is_match(subject),
+        }
+    }
+}
+
+/// Custom keyless identity verifier — matches the cert SAN (Email or URI)
+/// against an exact string or regex, and the OIDC issuer against an exact
+/// expected value. sigstore-rs's built-in `CertSubjectUrlVerifier` is
+/// exact-only and URI-only; this one accepts both URI and Email and supports
+/// regex (matching cosign's CLI `--certificate-identity-regexp` flag).
+#[derive(Debug)]
+struct KeylessIdentityVerifier {
+    identity: IdentityMatch,
+    issuer: String,
+}
+
+impl VerificationConstraint for KeylessIdentityVerifier {
+    fn verify(&self, layer: &SignatureLayer) -> Result<bool, SigstoreError> {
+        let Some(cert) = &layer.certificate_signature else {
+            return Ok(false);
+        };
+        // Issuer must match exactly (cosign-equivalent semantics).
+        match &cert.issuer {
+            Some(iss) if iss == &self.issuer => {}
+            _ => return Ok(false),
+        }
+        let subject_str = match &cert.subject {
+            CertificateSubject::Uri(u) => u.as_str(),
+            CertificateSubject::Email(e) => e.as_str(),
+        };
+        Ok(self.identity.matches(subject_str))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_keyless(
+    runtime: &Runtime,
+    reference: &OciReference,
+    image_digest: &str,
+    auth: &AuthInputs,
+    identity: &IdentityMatcher,
+    oidc_issuer: &str,
+    trust_root_choice: &TrustRoot,
+    rekor: &RekorPolicy,
+    envelope_paths: &[std::path::PathBuf],
+) -> Result<VerificationReport, OciError> {
+    // v1 limitations — surface early with InvalidPolicy so the user knows.
+    if let TrustRoot::Custom(path) = trust_root_choice {
+        return Err(OciError::InvalidPolicy(format!(
+            "--trust-root {} is not yet wired (v1 keyless uses the bundled \
+             Sigstore public-good TUF root only)",
+            path.display()
+        )));
+    }
+    if matches!(rekor, RekorPolicy::IgnoreTlog) {
+        eprintln!(
+            "note: --insecure-ignore-tlog is not yet wired for keyless v1 — \
+             Rekor transparency-log inclusion will be verified"
+        );
+    }
+
+    let identity_match = IdentityMatch::from_policy(identity)?;
+
+    let mut report = VerificationReport {
+        image_signature: SignatureVerdict::Skipped,
+        attestations: Vec::new(),
+        digest_binding_ok: true,
+        findings: Vec::new(),
+    };
+
+    // 1. Image signature via sigstore-rs's cosign Client + Sigstore trust root.
+    report.image_signature = verify_keyless_image_signature(
+        runtime,
+        reference,
+        image_digest,
+        auth,
+        identity_match,
+        oidc_issuer,
+    )?;
+    if let SignatureVerdict::Failed(ref msg) = report.image_signature {
+        report.findings.push(OciVerificationFinding {
+            rule_id: "SBOM-OCI-SIG-002".to_string(),
+            severity: ViolationSeverity::Error,
+            message: format!("Keyless image signature verification failed: {msg}"),
+        });
+    }
+
+    // 2. Attestation envelopes — keyless DSSE signature verification needs
+    // the per-envelope ephemeral cert (embedded in the cosign attestation
+    // manifest annotations, not in the DSSE envelope itself). That's the
+    // next increment. For now: signature verdict is Skipped, but we still
+    // run the digest-binding check (independent of crypto) so a mismatched
+    // SBOM is caught.
+    for envelope_path in envelope_paths {
+        let mut verdict = AttestationVerdict {
+            predicate_type: None,
+            verdict: SignatureVerdict::Skipped,
+            digest_binding_ok: true,
+        };
+        if let Ok(bytes) = std::fs::read(envelope_path)
+            && let Ok(s) = std::str::from_utf8(&bytes)
+            && let Ok(env) = parse_dsse_envelope(s)
+            && let Ok(payload_bytes) =
+                base64::engine::general_purpose::STANDARD.decode(env.payload.as_bytes())
+            && let Ok(payload_str) = std::str::from_utf8(&payload_bytes)
+            && let Ok(stmt) = parse_in_toto_statement(payload_str)
+        {
+            verdict.predicate_type = Some(stmt.predicate_type.clone());
+            verdict.digest_binding_ok = subject_matches_image_digest(&stmt, image_digest);
+        }
+        if !verdict.digest_binding_ok {
+            report.findings.push(OciVerificationFinding {
+                rule_id: "SBOM-OCI-ATT-002".to_string(),
+                severity: ViolationSeverity::Error,
+                message: format!(
+                    "DSSE envelope `{}` subject digest does not match image \
+                     digest {image_digest}",
+                    envelope_path.display()
+                ),
+            });
+            report.digest_binding_ok = false;
+        }
+        report.attestations.push(verdict);
+    }
+
+    Ok(report)
+}
+
+fn verify_keyless_image_signature(
+    runtime: &Runtime,
+    reference: &OciReference,
+    image_digest: &str,
+    auth: &AuthInputs,
+    identity_match: IdentityMatch,
+    oidc_issuer: &str,
+) -> Result<SignatureVerdict, OciError> {
+    let sigstore_auth = to_sigstore_auth(auth);
+    let sigstore_ref: SigstoreOciRef = reference.to_string().parse().map_err(|e| {
+        OciError::InvalidReference(format!("sigstore cannot parse `{reference}`: {e}"))
+    })?;
+    let oidc_issuer = oidc_issuer.to_string();
+    // First run fetches the Sigstore TUF root over the network; subsequent
+    // runs reuse the cache. Ensure the directory exists so the underlying
+    // tough library can write to it.
+    let cache_dir = crate::pipeline::dirs::cache_dir().map(|d| d.join("sigstore-tuf"));
+    if let Some(ref dir) = cache_dir {
+        let _ = std::fs::create_dir_all(dir);
+    }
+
+    let outcome = runtime.block_on(async move {
+        // Bundled Sigstore public-good TUF root. First run hits the network
+        // to fetch the trusted_root.json; subsequent runs reuse the cache.
+        let trust_root = SigstoreTrustRoot::new(cache_dir.as_deref())
+            .await
+            .map_err(|e| format!("fetch Sigstore TUF root: {e}"))?;
+        let mut client = ClientBuilder::default()
+            .with_trust_repository(&trust_root)
+            .map_err(|e| format!("trust repository: {e}"))?
+            .build()
+            .map_err(|e| format!("sigstore client build: {e}"))?;
+        let (cosign_ref, _) = client
+            .triangulate(&sigstore_ref, &sigstore_auth)
+            .await
+            .map_err(|e| format!("triangulate: {e}"))?;
+        let layers = client
+            .trusted_signature_layers(&sigstore_auth, image_digest, &cosign_ref)
+            .await
+            .map_err(|e| format!("pull signature layers: {e}"))?;
+        if layers.is_empty() {
+            return Err("no signature layers found at the cosign .sig tag".to_string());
+        }
+        let verifier = KeylessIdentityVerifier {
+            identity: identity_match,
+            issuer: oidc_issuer,
+        };
+        let constraints: VerificationConstraintVec = vec![Box::new(verifier)];
+        verify_constraints(&layers, constraints.iter()).map_err(|e| {
+            format!(
+                "no signature layer matched identity / issuer — {} cert(s) inspected: {e}",
+                layers.len()
+            )
+        })?;
+        Ok::<_, String>(layers.len())
+    });
+
+    Ok(match outcome {
+        Ok(_) => SignatureVerdict::Verified,
+        Err(msg) => SignatureVerdict::Failed(msg),
+    })
+}
+
 /// DSSE Pre-Authentication Encoding (RFC: secure-systems-lab/dsse v1.0).
 ///
 /// `DSSEv1 <payloadType_len> <payloadType> <payload_len> <payload_bytes>`
@@ -350,7 +593,10 @@ mod tests {
     }
 
     #[test]
-    fn keyless_returns_not_implemented_for_now() {
+    fn keyless_custom_trust_root_is_rejected_with_invalid_policy() {
+        // --trust-root <path> isn't wired in v1; the keyless path must fail
+        // up front with InvalidPolicy rather than silently fall back. No
+        // network is touched on this path.
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -358,13 +604,52 @@ mod tests {
         let policy = VerificationPolicy::Keyless {
             identity: crate::oci::IdentityMatcher::Exact("x".to_string()),
             oidc_issuer: "https://issuer".to_string(),
-            trust_root: crate::oci::TrustRoot::BundledPublicGood,
+            trust_root: crate::oci::TrustRoot::Custom(std::path::PathBuf::from(
+                "/etc/sigstore/root.json",
+            )),
             rekor: crate::oci::RekorPolicy::IgnoreTlog,
         };
         let reference = OciReference::parse("ghcr.io/acme/api:v1").unwrap();
         let auth = AuthInputs::default();
         let r = verify_image(&runtime, &reference, "sha256:abc", &auth, &policy, &[]);
-        assert!(matches!(r, Err(OciError::NotImplemented(_))));
+        assert!(matches!(r, Err(OciError::InvalidPolicy(_))));
+    }
+
+    #[test]
+    fn keyless_invalid_regex_returns_invalid_policy() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let policy = VerificationPolicy::Keyless {
+            identity: crate::oci::IdentityMatcher::Regexp("[invalid-regex".to_string()),
+            oidc_issuer: "https://issuer".to_string(),
+            trust_root: crate::oci::TrustRoot::BundledPublicGood,
+            rekor: crate::oci::RekorPolicy::Online("https://rekor.sigstore.dev".to_string()),
+        };
+        let reference = OciReference::parse("ghcr.io/acme/api:v1").unwrap();
+        let auth = AuthInputs::default();
+        let r = verify_image(&runtime, &reference, "sha256:abc", &auth, &policy, &[]);
+        assert!(matches!(r, Err(OciError::InvalidPolicy(_))));
+    }
+
+    #[test]
+    fn identity_match_exact_and_regex() {
+        let exact = IdentityMatch::from_policy(&IdentityMatcher::Exact(
+            "https://github.com/acme/api/.github/workflows/release.yml@refs/tags/v1".to_string(),
+        ))
+        .unwrap();
+        assert!(
+            exact.matches("https://github.com/acme/api/.github/workflows/release.yml@refs/tags/v1")
+        );
+        assert!(!exact.matches("https://github.com/other/api"));
+
+        let regex = IdentityMatch::from_policy(&IdentityMatcher::Regexp(
+            "^https://github\\.com/acme/.+".to_string(),
+        ))
+        .unwrap();
+        assert!(regex.matches("https://github.com/acme/api/whatever"));
+        assert!(!regex.matches("https://github.com/other/api"));
     }
 
     #[test]
