@@ -40,6 +40,7 @@
 //! image-signature path is Rekor-validated by sigstore-rs, which is the
 //! strongest publisher trust anchor.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use base64::Engine;
@@ -51,6 +52,7 @@ use sigstore::cosign::{ClientBuilder, CosignCapabilities, verify_constraints};
 use sigstore::crypto::{CosignVerificationKey, Signature};
 use sigstore::errors::SigstoreError;
 use sigstore::registry::{Auth as SigstoreAuth, OciReference as SigstoreOciRef};
+use sigstore::trust::ManualTrustRoot;
 use sigstore::trust::TrustRoot as SigstoreTrustRootTrait;
 use sigstore::trust::sigstore::SigstoreTrustRoot;
 use tokio::runtime::Runtime;
@@ -79,10 +81,9 @@ use super::{
 ///
 /// # Errors
 ///
-/// - [`OciError::InvalidPolicy`] when the supplied key or identity regex
-///   can't be loaded, or when a v1-unsupported keyless flag (`--trust-root`
-///   custom path) is requested.
-/// - [`OciError::Io`] when reading the key file fails.
+/// - [`OciError::InvalidPolicy`] when the supplied key, identity regex, or
+///   `--trust-root` PEM file can't be loaded.
+/// - [`OciError::Io`] when reading the key or trust-root file fails.
 pub fn verify_image(
     runtime: &Runtime,
     reference: &OciReference,
@@ -333,6 +334,141 @@ fn verify_envelope_file(
 }
 
 // ============================================================================
+// Trust root assembly (bundled / custom, ignore-tlog)
+// ============================================================================
+
+/// Constructed trust root, with Fulcio CAs and (optionally) Rekor keys.
+///
+/// Holds either the bundled Sigstore public-good TUF root (`SigstoreTrustRoot`)
+/// or a `ManualTrustRoot` assembled from a custom Fulcio CA bundle and/or an
+/// empty Rekor key list (when `--insecure-ignore-tlog` is set).
+enum TrustRootKind {
+    Bundled(SigstoreTrustRoot),
+    Manual(ManualTrustRoot<'static>),
+}
+
+impl TrustRootKind {
+    fn as_trust_root(&self) -> &dyn SigstoreTrustRootTrait {
+        match self {
+            Self::Bundled(t) => t,
+            Self::Manual(t) => t,
+        }
+    }
+
+    /// Owned DER bytes for each Fulcio CA, for the per-attestation chain
+    /// validator (which can't borrow across the runtime boundary).
+    fn fulcio_cert_bytes(&self) -> Vec<Vec<u8>> {
+        match self {
+            Self::Bundled(t) => t
+                .fulcio_certs()
+                .map(|certs| certs.into_iter().map(|c| c.as_ref().to_vec()).collect())
+                .unwrap_or_default(),
+            Self::Manual(t) => t
+                .fulcio_certs()
+                .map(|certs| certs.into_iter().map(|c| c.as_ref().to_vec()).collect())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+fn build_trust_root(
+    runtime: &Runtime,
+    choice: &TrustRoot,
+    rekor: &RekorPolicy,
+) -> Result<TrustRootKind, OciError> {
+    let cache_dir = crate::pipeline::dirs::cache_dir().map(|d| d.join("sigstore-tuf"));
+    if let Some(ref dir) = cache_dir {
+        let _ = std::fs::create_dir_all(dir);
+    }
+
+    // Strict bundled path needs no surgery — pass straight through to sigstore-rs.
+    if matches!(choice, TrustRoot::BundledPublicGood) && matches!(rekor, RekorPolicy::Online(_)) {
+        let root = runtime
+            .block_on(SigstoreTrustRoot::new(cache_dir.as_deref()))
+            .map_err(|e| OciError::Registry(format!("fetch Sigstore TUF root: {e}")))?;
+        return Ok(TrustRootKind::Bundled(root));
+    }
+
+    // Otherwise build a ManualTrustRoot. Start with whichever Fulcio source
+    // the policy selected.
+    let fulcio_certs: Vec<rustls_pki_types::CertificateDer<'static>> = match choice {
+        TrustRoot::BundledPublicGood => {
+            // Need the bundled Fulcio + (optionally) ctfe / rekor.
+            let bundled = runtime
+                .block_on(SigstoreTrustRoot::new(cache_dir.as_deref()))
+                .map_err(|e| OciError::Registry(format!("fetch Sigstore TUF root: {e}")))?;
+            bundled
+                .fulcio_certs()
+                .map_err(|e| OciError::Registry(format!("read bundled Fulcio certs: {e}")))?
+                .into_iter()
+                .map(|c| c.into_owned())
+                .collect()
+        }
+        TrustRoot::Custom(path) => load_pem_certs(path)?,
+    };
+
+    // Rekor keys: empty when `--insecure-ignore-tlog` is set (this turns off
+    // transparency-log inclusion while leaving Fulcio chain validation in
+    // place). Otherwise inherit the bundled Rekor key set. (sigstore-rs 0.13
+    // doesn't expose a way to swap the Rekor URL without rebuilding
+    // internals, so `RekorPolicy::Online(custom_url)` falls back to
+    // bundled-only for now.)
+    let rekor_keys: BTreeMap<String, Vec<u8>> = if matches!(rekor, RekorPolicy::IgnoreTlog) {
+        BTreeMap::new()
+    } else {
+        runtime
+            .block_on(SigstoreTrustRoot::new(cache_dir.as_deref()))
+            .ok()
+            .map(|r| {
+                r.rekor_keys()
+                    .map(|keys| keys.into_iter().map(|(k, v)| (k, v.to_vec())).collect())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
+    };
+    let ctfe_keys: BTreeMap<String, Vec<u8>> = runtime
+        .block_on(SigstoreTrustRoot::new(cache_dir.as_deref()))
+        .ok()
+        .map(|r| {
+            r.ctfe_keys()
+                .map(|keys| keys.into_iter().map(|(k, v)| (k, v.to_vec())).collect())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+
+    Ok(TrustRootKind::Manual(ManualTrustRoot {
+        fulcio_certs,
+        rekor_keys,
+        ctfe_keys,
+    }))
+}
+
+/// Load one or more PEM-encoded CA certificates from a file.
+fn load_pem_certs(
+    path: &std::path::Path,
+) -> Result<Vec<rustls_pki_types::CertificateDer<'static>>, OciError> {
+    let bytes = std::fs::read(path).map_err(OciError::Io)?;
+    let blocks = pem::parse_many(&bytes).map_err(|e| {
+        OciError::InvalidPolicy(format!(
+            "parse --trust-root PEM file {}: {e}",
+            path.display()
+        ))
+    })?;
+    let certs: Vec<rustls_pki_types::CertificateDer<'static>> = blocks
+        .into_iter()
+        .filter(|b| b.tag() == "CERTIFICATE")
+        .map(|b| rustls_pki_types::CertificateDer::from(b.into_contents()))
+        .collect();
+    if certs.is_empty() {
+        return Err(OciError::InvalidPolicy(format!(
+            "no CERTIFICATE PEM blocks in --trust-root {}",
+            path.display()
+        )));
+    }
+    Ok(certs)
+}
+
+// ============================================================================
 // Keyless verification
 // ============================================================================
 
@@ -405,21 +541,6 @@ fn verify_keyless(
     rekor: &RekorPolicy,
     envelope_paths: &[std::path::PathBuf],
 ) -> Result<VerificationReport, OciError> {
-    // v1 limitations — surface early with InvalidPolicy so the user knows.
-    if let TrustRoot::Custom(path) = trust_root_choice {
-        return Err(OciError::InvalidPolicy(format!(
-            "--trust-root {} is not yet wired (v1 keyless uses the bundled \
-             Sigstore public-good TUF root only)",
-            path.display()
-        )));
-    }
-    if matches!(rekor, RekorPolicy::IgnoreTlog) {
-        eprintln!(
-            "note: --insecure-ignore-tlog is not yet wired for keyless v1 — \
-             Rekor transparency-log inclusion will be verified"
-        );
-    }
-
     let identity_match = IdentityMatch::from_policy(identity)?;
 
     let mut report = VerificationReport {
@@ -429,18 +550,16 @@ fn verify_keyless(
         findings: Vec::new(),
     };
 
-    // Fetch the Sigstore trust root once (cached on disk after the first
-    // call). It's used twice: by sigstore-rs's cosign Client for the image
-    // signature path, and by our own per-attestation chain validator.
-    let cache_dir = crate::pipeline::dirs::cache_dir().map(|d| d.join("sigstore-tuf"));
-    if let Some(ref dir) = cache_dir {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let trust_root_result = runtime.block_on(SigstoreTrustRoot::new(cache_dir.as_deref()));
-    let trust_root = match trust_root_result {
+    // Build the trust root according to the policy:
+    //   - `BundledPublicGood` → fetch Sigstore TUF (cached).
+    //   - `Custom(path)` → load Fulcio CA PEM(s) from disk.
+    // Rekor handling:
+    //   - `Online(url)` → use the trust root's Rekor key(s).
+    //   - `IgnoreTlog`  → strip Rekor keys; Fulcio chain validation still runs.
+    let trust_root = match build_trust_root(runtime, trust_root_choice, rekor) {
         Ok(t) => t,
         Err(e) => {
-            let msg = format!("fetch Sigstore TUF root: {e}");
+            let msg = format!("{e}");
             report.image_signature = SignatureVerdict::Failed(msg.clone());
             report.findings.push(OciVerificationFinding {
                 rule_id: "SBOM-OCI-SIG-002".to_string(),
@@ -450,10 +569,7 @@ fn verify_keyless(
             return Ok(report);
         }
     };
-    let fulcio_cert_bytes: Vec<Vec<u8>> = trust_root
-        .fulcio_certs()
-        .map(|certs| certs.into_iter().map(|c| c.as_ref().to_vec()).collect())
-        .unwrap_or_default();
+    let fulcio_cert_bytes = trust_root.fulcio_cert_bytes();
 
     // 1. Image signature via sigstore-rs's cosign Client.
     report.image_signature = verify_keyless_image_signature(
@@ -720,7 +836,7 @@ fn verify_keyless_image_signature(
     auth: &AuthInputs,
     identity_match: IdentityMatch,
     oidc_issuer: &str,
-    trust_root: &SigstoreTrustRoot,
+    trust_root: &TrustRootKind,
 ) -> Result<SignatureVerdict, OciError> {
     let sigstore_auth = to_sigstore_auth(auth);
     let sigstore_ref: SigstoreOciRef = reference.to_string().parse().map_err(|e| {
@@ -730,7 +846,7 @@ fn verify_keyless_image_signature(
 
     let outcome = runtime.block_on(async {
         let mut client = ClientBuilder::default()
-            .with_trust_repository(trust_root)
+            .with_trust_repository(trust_root.as_trust_root())
             .map_err(|e| format!("trust repository: {e}"))?
             .build()
             .map_err(|e| format!("sigstore client build: {e}"))?;
@@ -909,25 +1025,16 @@ mod tests {
     }
 
     #[test]
-    fn keyless_custom_trust_root_is_rejected_with_invalid_policy() {
-        // --trust-root <path> isn't wired in v1; the keyless path must fail
-        // up front with InvalidPolicy rather than silently fall back. No
-        // network is touched on this path.
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let policy = VerificationPolicy::Keyless {
-            identity: crate::oci::IdentityMatcher::Exact("x".to_string()),
-            oidc_issuer: "https://issuer".to_string(),
-            trust_root: crate::oci::TrustRoot::Custom(std::path::PathBuf::from(
-                "/etc/sigstore/root.json",
-            )),
-            rekor: crate::oci::RekorPolicy::IgnoreTlog,
-        };
-        let reference = OciReference::parse("ghcr.io/acme/api:v1").unwrap();
-        let auth = AuthInputs::default();
-        let r = verify_image(&runtime, &reference, "sha256:abc", &auth, &policy, &[]);
+    fn load_pem_certs_rejects_empty_or_invalid_file() {
+        use std::io::Write;
+        // Nonexistent file → Io.
+        let r = load_pem_certs(std::path::Path::new("/nonexistent/trust-root.pem"));
+        assert!(matches!(r, Err(OciError::Io(_))));
+
+        // File with no CERTIFICATE PEM blocks → InvalidPolicy.
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "no PEM here").unwrap();
+        let r = load_pem_certs(f.path());
         assert!(matches!(r, Err(OciError::InvalidPolicy(_))));
     }
 
