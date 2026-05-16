@@ -16,18 +16,28 @@
 //!
 //! # Scope
 //!
-//! Key-based and keyless verification of the **image signature** are both
-//! wired. Keyless validates the Fulcio cert chain, requires Rekor
-//! transparency-log inclusion (via the bundled Sigstore public-good TUF
-//! root), and matches the cert SAN + OIDC issuer against the configured
-//! policy (exact or regex).
+//! Key-based and keyless verification of **both** the image signature and
+//! every attached attestation DSSE envelope are wired.
 //!
-//! Per-attestation DSSE signature verification is fully wired for key-based;
-//! keyless DSSE verification (which needs each attestation's ephemeral cert
-//! out of the cosign attestation manifest annotations) is the next
-//! increment. Until that lands, keyless attestations are reported as
-//! `Skipped` for the signature verdict, but their in-toto subject digest is
-//! still matched against the image digest so a mismatched SBOM is caught.
+//! Keyless image signatures: full pipeline via sigstore-rs (`triangulate` +
+//! `trusted_signature_layers`) — Fulcio cert chain validation + Rekor
+//! transparency-log inclusion + identity (SAN exact / regex) + OIDC issuer
+//! match against the configured policy.
+//!
+//! Keyless attestations: the resolver captures each cosign attestation
+//! layer's `dev.sigstore.cosign/certificate` annotation as a sidecar
+//! (`<kind>-<short>.cert.pem`). The verifier parses it with `x509-cert`,
+//! extracts the SAN via `sigstore::cosign::signature_layers::CertificateSubject`,
+//! extracts the Fulcio OIDC-issuer extension (OID `1.3.6.1.4.1.57264.1.1`),
+//! matches both against the policy, derives a `CosignVerificationKey` from
+//! the cert's `SubjectPublicKeyInfo`, and verifies the DSSE signatures over
+//! PAE. Digest binding (`subject.digest` against the resolved image digest)
+//! is always computed.
+//!
+//! **v1 limitation:** the per-attestation cert chain is NOT validated
+//! against Fulcio in this pass. The keyless image-signature path *is*
+//! Fulcio-chain-validated by sigstore-rs, so that remains the trust
+//! anchor; closing the per-attestation chain gap is the obvious follow-up.
 
 use std::path::Path;
 
@@ -42,6 +52,8 @@ use sigstore::errors::SigstoreError;
 use sigstore::registry::{Auth as SigstoreAuth, OciReference as SigstoreOciRef};
 use sigstore::trust::sigstore::SigstoreTrustRoot;
 use tokio::runtime::Runtime;
+use x509_cert::Certificate as X509Certificate;
+use x509_cert::der::DecodePem;
 
 use crate::quality::ViolationSeverity;
 
@@ -65,9 +77,10 @@ use super::{
 ///
 /// # Errors
 ///
-/// - [`OciError::NotImplemented`] for keyless policies (not yet wired).
-/// - [`OciError::InvalidPolicy`] when the public key can't be loaded.
-/// - I/O errors when reading the key or envelope files.
+/// - [`OciError::InvalidPolicy`] when the supplied key or identity regex
+///   can't be loaded, or when a v1-unsupported keyless flag (`--trust-root`
+///   custom path) is requested.
+/// - [`OciError::Io`] when reading the key file fails.
 pub fn verify_image(
     runtime: &Runtime,
     reference: &OciReference,
@@ -431,28 +444,27 @@ fn verify_keyless(
         });
     }
 
-    // 2. Attestation envelopes — keyless DSSE signature verification needs
-    // the per-envelope ephemeral cert (embedded in the cosign attestation
-    // manifest annotations, not in the DSSE envelope itself). That's the
-    // next increment. For now: signature verdict is Skipped, but we still
-    // run the digest-binding check (independent of crypto) so a mismatched
-    // SBOM is caught.
+    // 2. Attestation envelopes — keyless DSSE signature verification using
+    // the per-envelope ephemeral cert that the fetcher captured as a
+    // sidecar (`<kind>-<short>.cert.pem`, from the cosign
+    // `dev.sigstore.cosign/certificate` layer annotation).
+    let identity_match_for_atts = IdentityMatch::from_policy(identity)?;
     for envelope_path in envelope_paths {
-        let mut verdict = AttestationVerdict {
-            predicate_type: None,
-            verdict: SignatureVerdict::Skipped,
-            digest_binding_ok: true,
-        };
-        if let Ok(bytes) = std::fs::read(envelope_path)
-            && let Ok(s) = std::str::from_utf8(&bytes)
-            && let Ok(env) = parse_dsse_envelope(s)
-            && let Ok(payload_bytes) =
-                base64::engine::general_purpose::STANDARD.decode(env.payload.as_bytes())
-            && let Ok(payload_str) = std::str::from_utf8(&payload_bytes)
-            && let Ok(stmt) = parse_in_toto_statement(payload_str)
-        {
-            verdict.predicate_type = Some(stmt.predicate_type.clone());
-            verdict.digest_binding_ok = subject_matches_image_digest(&stmt, image_digest);
+        let verdict = verify_attestation_keyless(
+            envelope_path,
+            image_digest,
+            &identity_match_for_atts,
+            oidc_issuer,
+        );
+        if let SignatureVerdict::Failed(ref msg) = verdict.verdict {
+            report.findings.push(OciVerificationFinding {
+                rule_id: "SBOM-OCI-ATT-001".to_string(),
+                severity: ViolationSeverity::Error,
+                message: format!(
+                    "DSSE envelope `{}` failed keyless verification: {msg}",
+                    envelope_path.display()
+                ),
+            });
         }
         if !verdict.digest_binding_ok {
             report.findings.push(OciVerificationFinding {
@@ -470,6 +482,192 @@ fn verify_keyless(
     }
 
     Ok(report)
+}
+
+/// Verify a single attestation DSSE envelope keylessly.
+///
+/// Looks for a sidecar cert at `<envelope>.cert.pem` (written by the
+/// resolver from the `dev.sigstore.cosign/certificate` layer annotation).
+/// If present:
+///   * parses the cert with `x509-cert`
+///   * extracts the SAN via `sigstore::cosign::signature_layers::CertificateSubject`
+///     and matches against the configured identity policy
+///   * extracts the Fulcio OIDC-issuer extension
+///     (OID `1.3.6.1.4.1.57264.1.1`) and matches against the configured issuer
+///   * derives a `CosignVerificationKey` from the cert's
+///     `SubjectPublicKeyInfo` and verifies each DSSE signature over PAE
+///
+/// Always runs the in-toto subject-digest binding check, even on cert
+/// failure — that's a useful tamper signal independent of crypto.
+///
+/// **v1 limitation:** the cert chain is NOT validated against Fulcio in
+/// this commit. The image-signature keyless path (which sigstore-rs
+/// validates fully) is the trust anchor. Full chain validation is the
+/// obvious follow-up.
+fn verify_attestation_keyless(
+    envelope_path: &std::path::Path,
+    image_digest: &str,
+    identity: &IdentityMatch,
+    oidc_issuer: &str,
+) -> AttestationVerdict {
+    let mut verdict = AttestationVerdict {
+        predicate_type: None,
+        verdict: SignatureVerdict::Skipped,
+        digest_binding_ok: true,
+    };
+
+    // Read envelope + decode payload (used for both DSSE PAE and the
+    // subject-digest check). Continue past errors so the binding check
+    // can still surface a useful finding when we can.
+    let envelope_bytes = match std::fs::read(envelope_path) {
+        Ok(b) => b,
+        Err(e) => {
+            verdict.verdict = SignatureVerdict::Failed(format!("read envelope: {e}"));
+            return verdict;
+        }
+    };
+    let envelope = match parse_dsse_envelope(std::str::from_utf8(&envelope_bytes).unwrap_or("")) {
+        Ok(e) => e,
+        Err(e) => {
+            verdict.verdict = SignatureVerdict::Failed(format!("parse envelope: {e}"));
+            return verdict;
+        }
+    };
+    let payload_bytes =
+        match base64::engine::general_purpose::STANDARD.decode(envelope.payload.as_bytes()) {
+            Ok(b) => b,
+            Err(e) => {
+                verdict.verdict = SignatureVerdict::Failed(format!("decode payload base64: {e}"));
+                return verdict;
+            }
+        };
+
+    // Digest binding — independent of crypto, always computed.
+    if let Ok(payload_str) = std::str::from_utf8(&payload_bytes)
+        && let Ok(stmt) = parse_in_toto_statement(payload_str)
+    {
+        verdict.predicate_type = Some(stmt.predicate_type.clone());
+        verdict.digest_binding_ok = subject_matches_image_digest(&stmt, image_digest);
+    } else {
+        verdict.digest_binding_ok = false;
+    }
+
+    // Locate the sidecar cert. Filename convention: replace `.dsse.json`
+    // with `.cert.pem` on the envelope path.
+    let cert_path = match envelope_path
+        .to_str()
+        .and_then(|s| s.strip_suffix(".dsse.json"))
+    {
+        Some(stem) => std::path::PathBuf::from(format!("{stem}.cert.pem")),
+        None => {
+            verdict.verdict = SignatureVerdict::Failed(
+                "envelope file does not have a .dsse.json extension".to_string(),
+            );
+            return verdict;
+        }
+    };
+    if !cert_path.exists() {
+        verdict.verdict = SignatureVerdict::Failed(format!(
+            "no cosign cert annotation found on this attestation layer (expected at {}); \
+             keyless verification needs a Fulcio-issued ephemeral cert. If this image was \
+             signed with `cosign sign --key`, re-run with --key COSIGN_PUB instead",
+            cert_path.display()
+        ));
+        return verdict;
+    }
+    let cert_pem = match std::fs::read(&cert_path) {
+        Ok(b) => b,
+        Err(e) => {
+            verdict.verdict =
+                SignatureVerdict::Failed(format!("read cert sidecar {}: {e}", cert_path.display()));
+            return verdict;
+        }
+    };
+
+    // Parse the cert and run the identity + issuer checks.
+    let cert = match X509Certificate::from_pem(&cert_pem) {
+        Ok(c) => c,
+        Err(e) => {
+            verdict.verdict = SignatureVerdict::Failed(format!("parse cert PEM: {e}"));
+            return verdict;
+        }
+    };
+    let subject = match CertificateSubject::from_certificate(&cert) {
+        Ok(s) => s,
+        Err(e) => {
+            verdict.verdict = SignatureVerdict::Failed(format!("extract SAN: {e}"));
+            return verdict;
+        }
+    };
+    let subject_str = match &subject {
+        CertificateSubject::Uri(u) => u.as_str(),
+        CertificateSubject::Email(e) => e.as_str(),
+    };
+    if !identity.matches(subject_str) {
+        verdict.verdict = SignatureVerdict::Failed(format!(
+            "cert SAN `{subject_str}` does not match the configured identity"
+        ));
+        return verdict;
+    }
+    match extract_oidc_issuer_extension(&cert) {
+        Some(iss) if iss == oidc_issuer => {}
+        Some(iss) => {
+            verdict.verdict = SignatureVerdict::Failed(format!(
+                "cert OIDC issuer `{iss}` does not match `{oidc_issuer}`"
+            ));
+            return verdict;
+        }
+        None => {
+            verdict.verdict = SignatureVerdict::Failed(
+                "cert missing OIDC issuer extension (OID 1.3.6.1.4.1.57264.1.1)".to_string(),
+            );
+            return verdict;
+        }
+    }
+
+    // Verify each DSSE signature against the cert's public key.
+    let key = match CosignVerificationKey::try_from(&cert.tbs_certificate.subject_public_key_info) {
+        Ok(k) => k,
+        Err(e) => {
+            verdict.verdict = SignatureVerdict::Failed(format!("extract pubkey from cert: {e}"));
+            return verdict;
+        }
+    };
+    if envelope.signatures.is_empty() {
+        verdict.verdict = SignatureVerdict::Failed("envelope has no signatures".to_string());
+        return verdict;
+    }
+    let pae = dsse_pae(&envelope.payload_type, &payload_bytes);
+    let mut last_err: Option<String> = None;
+    let mut any_ok = false;
+    for sig in &envelope.signatures {
+        match key.verify_signature(Signature::Base64Encoded(sig.sig.as_bytes()), &pae) {
+            Ok(()) => {
+                any_ok = true;
+                break;
+            }
+            Err(e) => last_err = Some(format!("{e}")),
+        }
+    }
+    verdict.verdict = if any_ok {
+        SignatureVerdict::Verified
+    } else {
+        SignatureVerdict::Failed(last_err.unwrap_or_else(|| "no signature verified".to_string()))
+    };
+    verdict
+}
+
+/// Fulcio "OIDC Issuer" cert extension (legacy OID 1.3.6.1.4.1.57264.1.1).
+/// The extension value is a raw UTF-8 string holding the issuer URL.
+fn extract_oidc_issuer_extension(cert: &X509Certificate) -> Option<String> {
+    use x509_cert::der::asn1::ObjectIdentifier;
+    let target = ObjectIdentifier::new("1.3.6.1.4.1.57264.1.1").ok()?;
+    let extensions = cert.tbs_certificate.extensions.as_ref()?;
+    extensions
+        .iter()
+        .find(|ext| ext.extn_id == target)
+        .and_then(|ext| std::str::from_utf8(ext.extn_value.as_bytes()).ok())
+        .map(|s| s.to_string())
 }
 
 fn verify_keyless_image_signature(

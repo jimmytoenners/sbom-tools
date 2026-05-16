@@ -469,6 +469,28 @@ fn materialize_blob(
         }
     }
 
+    // Capture the cosign cert annotation as a sidecar (`<prefix>-<short>.cert.pem`)
+    // so the keyless attestation verifier can find it. Cosign stores the
+    // ephemeral Fulcio cert on each attestation layer under
+    // `dev.sigstore.cosign/certificate`.
+    if let Some(annotations) = layer.annotations.as_ref() {
+        // Cosign stores the ephemeral Fulcio cert under one of two
+        // annotation keys — the legacy `cosignproject` namespace and the
+        // newer `sigstore` namespace. We accept either. Key-based images
+        // (signed without OIDC/Fulcio) won't carry this annotation at
+        // all; that case is surfaced by the keyless verifier with a
+        // suggestion to use --key instead.
+        let cert_pem = annotations
+            .get("dev.sigstore.cosign/certificate")
+            .or_else(|| annotations.get("dev.cosignproject.cosign/certificate"));
+        if let Some(cert_pem) = cert_pem {
+            let cert_path = output_dir.join(format!("{prefix}-{short}.cert.pem"));
+            if let Err(e) = std::fs::write(&cert_path, cert_pem) {
+                eprintln!("warning: write cosign cert sidecar failed: {e}");
+            }
+        }
+    }
+
     let unwrapped_media = if predicate_type.starts_with("https://cyclonedx.org/bom") {
         "application/vnd.cyclonedx+json"
     } else if predicate_type.starts_with("https://spdx.dev/Document") {

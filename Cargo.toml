@@ -65,6 +65,10 @@ base64 = { version = "0.22", optional = true }
 # Sigstore — cosign signature + DSSE envelope verification, Fulcio keyless,
 # Rekor transparency-log inclusion. Pre-1.0 with churn risk; pinned exactly.
 sigstore = { version = "0.13", default-features = false, features = ["cosign", "sigstore-trust-root"], optional = true }
+# X.509 cert parsing for keyless attestation verification. Sigstore-rs uses
+# this transitively at 0.2.x; adding it directly so we can extract SAN +
+# the Fulcio OIDC-issuer extension from per-attestation ephemeral certs.
+x509-cert = { version = "0.2", default-features = false, features = ["pem", "std"], optional = true }
 
 # Utilities
 chrono = { version = "0.4.44", features = ["serde"] }
@@ -86,7 +90,7 @@ enrichment = ["reqwest"]
 # Currently pulls in the registry-fetch deps (oci-client + tokio);
 # cosign verification (sigstore) lands in a follow-up commit — see
 # docs/oci-verify-plan.md.
-oci = ["dep:oci-client", "dep:tokio", "dep:base64", "dep:sigstore"]
+oci = ["dep:oci-client", "dep:tokio", "dep:base64", "dep:sigstore", "dep:x509-cert"]
 ffi = []
 
 [dev-dependencies]
