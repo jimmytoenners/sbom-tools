@@ -128,8 +128,14 @@ pub fn run_oci(config: OciCliConfig, action: OciAction) -> Result<i32> {
     };
     let resolver = OciResolver::new(policy.clone(), resolver_config, auth);
 
-    // 4. Show what's about to happen.
-    if !config.quiet {
+    // 4. Show what's about to happen. Suppress when the user asked for a
+    // structured output format (SARIF) so the JSON is the only thing on
+    // stdout for clean piping.
+    let structured_output = matches!(
+        config.output_format,
+        ReportFormat::Sarif | ReportFormat::Json
+    );
+    if !config.quiet && !structured_output {
         print_run_intent(action, &reference, &policy, &resolver, &config);
     }
 
@@ -144,11 +150,30 @@ pub fn run_oci(config: OciCliConfig, action: OciAction) -> Result<i32> {
         }
     };
 
-    if !config.quiet {
+    // 6. SARIF output path. For `oci verify` (the natural home), --output
+    // sarif emits a SARIF 2.1.0 document covering the verification verdict
+    // and every finding, then exits with the appropriate code. Pull/Report
+    // fall through to their text/JSON pipelines below.
+    if matches!(action, OciAction::Verify) && matches!(config.output_format, ReportFormat::Sarif) {
+        let sarif = crate::reports::generate_oci_sarif(
+            &reference,
+            &resolved.image_digest,
+            &resolved.verification,
+        )
+        .map_err(|e| anyhow::anyhow!("SARIF emit failed: {e}"))?;
+        let target = OutputTarget::from_option(config.output_file.clone());
+        write_output(&sarif, &target, config.quiet)?;
+        if !matches!(policy, VerificationPolicy::None) && !resolved.verification.passed() {
+            return Ok(exit_codes::OCI_VERIFICATION_FAILED);
+        }
+        return Ok(exit_codes::SUCCESS);
+    }
+
+    if !config.quiet && !structured_output {
         print_resolved(&resolved);
     }
 
-    // 6. Verification gate — when a policy was active, any failed signature
+    // 7. Verification gate — when a policy was active, any failed signature
     // or digest-binding mismatch short-circuits with exit code 6. The
     // artifacts stay on disk so an operator can inspect them; the failure
     // is loud and the exit code matches the proposal's contract.
@@ -163,7 +188,7 @@ pub fn run_oci(config: OciCliConfig, action: OciAction) -> Result<i32> {
         return Ok(exit_codes::OCI_VERIFICATION_FAILED);
     }
 
-    // 7. For `oci report`, additionally parse, enrich, apply VEX, and emit
+    // 8. For `oci report`, additionally parse, enrich, apply VEX, and emit
     // the vulnerability picture.
     if matches!(action, OciAction::Report) {
         return run_report_pipeline(&resolved, &config);

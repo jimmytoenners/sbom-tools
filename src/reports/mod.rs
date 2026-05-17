@@ -22,6 +22,8 @@ pub mod escape;
 mod html;
 mod json;
 mod markdown;
+#[cfg(feature = "oci")]
+pub mod oci_sarif;
 mod sarif;
 mod sidebyside;
 pub mod streaming;
@@ -33,6 +35,8 @@ pub use csv::CsvReporter;
 pub use html::HtmlReporter;
 pub use json::JsonReporter;
 pub use markdown::MarkdownReporter;
+#[cfg(feature = "oci")]
+pub use oci_sarif::generate_oci_sarif;
 pub use sarif::SarifReporter;
 pub use sarif::{generate_compliance_sarif, generate_multi_compliance_sarif};
 pub use sidebyside::SideBySideReporter;

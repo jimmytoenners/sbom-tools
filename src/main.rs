@@ -1387,7 +1387,14 @@ fn main() -> Result<()> {
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG").unwrap_or_else(|_| log_level.to_string()),
         ))
-        .with(tracing_subscriber::fmt::layer().with_target(false))
+        // Route tracing output to stderr so structured stdout (SARIF /
+        // JSON / etc.) stays a clean stream of pure output and doesn't get
+        // interleaved with INFO/WARN log lines.
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_writer(std::io::stderr),
+        )
         .init();
 
     // Dispatch to command handlers
@@ -1885,6 +1892,11 @@ fn main() -> Result<()> {
 
             let exit_code = cli::run_oci(config, cli_action)?;
             if exit_code != 0 {
+                // Flush stdout before process::exit — std::process::exit
+                // does NOT run destructors, so any buffered SARIF/JSON
+                // output would otherwise be dropped on the floor when
+                // exiting non-zero through a pipe.
+                let _ = io::stdout().flush();
                 std::process::exit(exit_code);
             }
             Ok(())
