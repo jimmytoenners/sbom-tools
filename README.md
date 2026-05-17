@@ -20,7 +20,7 @@
   <a href="https://scorecard.dev/viewer/?uri=github.com/sbom-tool/sbom-tools"><img src="https://api.scorecard.dev/projects/github.com/sbom-tool/sbom-tools/badge" alt="OpenSSF Scorecard"></a>
 </p>
 
-Semantic SBOM/CBOM diff, quality scoring, and analysis tool. Compare, validate, and grade software and cryptographic bills of materials across CycloneDX and SPDX formats.
+Semantic SBOM/CBOM diff, quality scoring, and analysis tool. Compare, validate, and grade software and cryptographic bills of materials across CycloneDX and SPDX formats — including SBOM/VEX artifacts pulled and cosign-verified directly from any OCI registry.
 
 ![sbom-tools diff summary](assets/tui-diff-summary.svg)
 
@@ -526,6 +526,29 @@ Pull, cosign-verify, and analyse the SBOM/VEX artifacts attached to a container
 image — all in one tool. Built behind the off-by-default `oci` feature
 (`cargo build --release --features oci`).
 
+**What this replaces.** Without this feature, getting a trustworthy vuln
+picture from a signed container image is a three-tool dance:
+
+```sh
+# Before — three tools, three exit-code contracts, and the digest-binding
+# check (was-this-SBOM-actually-signed-for-this-image) is on you to remember.
+cosign verify <image> --certificate-identity-regexp '…' --certificate-oidc-issuer '…'
+cosign download attestation <image> --predicate-type 'https://cyclonedx.org/bom' | jq -r .payload | base64 -d | jq .predicate > sbom.cdx.json
+sbom-tools vex apply sbom.cdx.json --vex vex.json --enrich-vulns
+```
+
+With the OCI feature wired, the same flow becomes one invocation that also
+enforces the in-toto subject digest is the image digest you actually pulled:
+
+```sh
+# After — one command, one exit-code contract (6 = verification failed),
+# digest binding enforced per attestation.
+sbom-tools oci report <image> \
+    --certificate-identity-regexp '…' \
+    --certificate-oidc-issuer '…' \
+    --enrich-vulns
+```
+
 **What's wired:**
 
 - Pull from any OCI registry (anonymous, bearer-token, basic auth, or
@@ -699,6 +722,21 @@ sbom-tools query "log4j" --version "<2.17.0" fleet/*.json -o json
 
 # Check license compliance with strict policy
 sbom-tools license-check sbom.json --strict --check-propagation
+
+# Gate a deploy on cosign keyless verification of the image and every
+# attached attestation. SARIF lands in results.sarif; exit 6 on any
+# signature/identity/digest-binding/chain failure.
+sbom-tools oci verify ghcr.io/acme/api:v1.4.0 \
+    --certificate-identity-regexp '^https://github.com/acme/.+' \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    -o sarif -O results.sarif
+
+# Combined: verify keylessly, then enrich the SBOM via OSV and fail on any
+# actionable vuln. Replaces the cosign + oras + sbom-tools dance.
+sbom-tools oci report ghcr.io/acme/api@sha256:abc... \
+    --certificate-identity-regexp '^https://github.com/acme/.+' \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --fail-on-vuln
 ```
 
 <details>
