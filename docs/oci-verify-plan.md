@@ -716,27 +716,56 @@ the existing parser fuzz targets.
 
 ---
 
-## Open questions
+## Status (as of the merge into this branch)
 
-1. ~~**MSRV split.**~~ **Resolved (2026-05-14):** a whole-project MSRV bump is
-   acceptable — no split MSRV. The new floor is set to whatever the pinned
-   `sigstore` / `oci-client` versions require, in the same change that adds
-   the dependencies.
-2. **Verification default.** Should `oci pull` verify by default once Phase 2
-   lands (with `--no-verify` to opt out)? Lean: **yes** — secure by default,
-   consistent with the exit-`6` contract.
-3. **`vulns` attestation ingestion.** Verified
-   `https://in-toto.io/attestation/vulns` attestations carry scan results.
-   Auto-merge them into the enrichment model, or just record their presence?
-   Lean: **record only in v1** — merging raises dedup/precedence questions
-   better handled in a dedicated proposal.
-4. **TUF root.** Vendor a pinned Sigstore public-good TUF root in the binary,
-   or fetch it at runtime on first use? Lean: **vendor a pinned root**,
-   refreshable via release updates — works air-gapped, no surprise network
-   call.
-5. **Multi-arch.** For an image index, verify only the selected platform
-   manifest, or the index digest *and* the platform manifest? Lean: **both** —
-   the index signature plus the resolved platform manifest's attestations.
+| Increment | Status |
+|---|---|
+| Skeleton (reference parsing, policy validation, CLI surface, exit codes) | ✅ shipped — `9fababb` |
+| Attestation module (DSSE + in-toto Statement + digest binding) | ✅ shipped — `edbc06d` |
+| Registry fetch via `oci-client` + `tokio` (`--no-verify` path) | ✅ shipped — `6ae624c` |
+| `oci report` end-to-end (DSSE unwrap, re-classify, enrich, summary) | ✅ shipped — `e99ea88` (rewritten to `5f8e150` after a commit-message scrub) |
+| Cosign **key-based** verification (image sig + DSSE envelopes + digest binding) | ✅ shipped — `0272208` |
+| Cosign **keyless** verification (Fulcio + Rekor + identity match) for image sig | ✅ shipped — `5f08150` |
+| Keyless DSSE attestation verification (per-envelope cert, SAN, issuer ext, DSSE sig) | ✅ shipped — `7fd8118` |
+| Per-attestation Fulcio chain validation | ✅ shipped — `028fa20` |
+| `--trust-root <PEM>` + `--insecure-ignore-tlog` | ✅ shipped — `72169a0` |
+| SARIF 2.1.0 emitter for `oci verify` | ✅ shipped — `b3ae4c9` |
+| MSRV | ✅ stayed on **Rust 1.88** — no bump needed |
+
+## Known remaining gaps (not blocking the feature)
+
+- **Custom Rekor URL.** `--rekor-url <URL>` is parsed and honoured against the
+  bundled Rekor key, but `sigstore-rs 0.13` doesn't surface a way to swap the
+  Rekor *endpoint* without rebuilding internals. Practically, this affects
+  private Sigstore Rekor deployments. Workaround today: use the bundled
+  Rekor or pair with `--insecure-ignore-tlog` for air-gapped use.
+- **`https://in-toto.io/attestation/vulns` ingestion.** Verified vuln-scan
+  attestations are recorded in the SARIF index but not auto-merged into the
+  OSV/KEV enrichment model. Deferred to a dedicated proposal.
+- **Multi-arch image index.** For a multi-arch index, we currently verify the
+  resolved platform manifest's signature/attestations but not the index
+  digest's own signature. Index-level verification is an additive follow-up.
+- **Sigstore Bundle format.** The modern `.sigstore` bundle format (with
+  embedded TUF/Rekor data) isn't read directly. The cosign tag-scheme and
+  Referrers API cover all observed registries today; bundle support is a
+  drop-in addition when adoption demands it.
+
+## Decisions made along the way
+
+1. ~~**MSRV split.**~~ **Resolved (2026-05-14):** no split needed.
+   `sigstore = 0.13` + `oci-client = 0.15` + `tokio` compile clean on the
+   existing Rust 1.88 toolchain.
+2. **Verification default.** ~~Open.~~ **Implemented (b3ae4c9 era):**
+   `oci pull` / `oci verify` / `oci report` all require an explicit
+   verification policy or `--no-verify`. No silent skipping.
+3. **`vulns` attestation ingestion.** **Decision: record only.** The cosign
+   vuln-attestation surfaces in the SARIF report but doesn't replace OSV/KEV.
+4. **TUF root.** **Decision: fetch + cache.** `SigstoreTrustRoot::new` is
+   given a cache path under `~/.cache/sbom-tools/sigstore-tuf`. First run
+   fetches the bundled public-good root; subsequent runs reuse the cache.
+   Custom TUF roots: see `--trust-root <PEM>` for Fulcio CA substitution.
+5. **Multi-arch.** **Decision (interim):** verify the resolved platform
+   manifest; index-level verification is the documented follow-up.
 
 ---
 

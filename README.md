@@ -39,7 +39,7 @@ Semantic SBOM/CBOM diff, quality scoring, and analysis tool. Compare, validate, 
 - **Fleet Comparison** — 1:N baseline comparison, timeline analysis across versions, and NxN matrix analysis, all with enrichment support
 - **Incremental Diff** — Section-selective recomputation for partial changes with cached matching results
 - **VEX Tracking** — Detect VEX state transitions (NotAffected → Affected) across SBOM versions, with `--fail-on-vex-gap` CI gate
-- **OCI Registry Ingestion** *(preview, feature-gated)* — Pull and cosign-verify the SBOM/VEX artifacts attached to a container image, then feed them straight into the pipeline — see [`docs/oci-verify-plan.md`](docs/oci-verify-plan.md)
+- **OCI Registry Ingestion** *(feature-gated)* — Pull SBOM/VEX artifacts from any OCI registry, cosign-verify keylessly (Fulcio + Rekor + identity match) or key-based, validate per-attestation Fulcio chains + DSSE signatures + in-toto digest binding, then feed the unwrapped predicates straight into the vuln/diff/report pipeline — see [`docs/oci-verify-plan.md`](docs/oci-verify-plan.md)
 - **Multiple Output Formats** — JSON, SARIF, HTML, Markdown, CSV, table, side-by-side, summary, and an interactive TUI
 - **Ecosystem-Aware** — Configurable per-ecosystem normalization rules, typosquat detection, pre-release version handling, and cross-ecosystem package correlation
 
@@ -107,7 +107,7 @@ cargo build --release
 # Without enrichment (lightweight build)
 cargo build --release --no-default-features
 
-# With OCI registry ingestion + cosign verification (preview)
+# With OCI registry ingestion + cosign verification
 cargo build --release --features oci
 ```
 
@@ -520,32 +520,46 @@ sbom-tools timeline v1.json v2.json v3.json
 sbom-tools matrix sbom1.json sbom2.json sbom3.json
 ```
 
-### OCI registry ingestion (preview)
+### OCI registry ingestion
 
-Pull and cosign-verify the SBOM/VEX artifacts attached to a container image, then
-feed them straight into the diff/enrich/report pipeline. Built behind the
-off-by-default `oci` feature (`cargo build --release --features oci`).
+Pull, cosign-verify, and analyse the SBOM/VEX artifacts attached to a container
+image — all in one tool. Built behind the off-by-default `oci` feature
+(`cargo build --release --features oci`).
 
-> **Status:** the command surface, image-reference parsing, and
-> verification-policy validation are implemented and tested. The registry client
-> and cosign verification — the `sigstore` / `oci-client` dependencies — are in
-> progress; see [`docs/oci-verify-plan.md`](docs/oci-verify-plan.md). Until they
-> land, the commands report what they *would* do and exit with code 3.
+**What's wired:**
+
+- Pull from any OCI registry (anonymous, bearer-token, basic auth, or
+  `~/.docker/config.json`); discovery via OCI 1.1 Referrers API with the
+  legacy cosign tag scheme (`sha256-<digest>.sbom` / `.att`) as a fallback.
+- DSSE envelopes are auto-unwrapped: CycloneDX → `.cdx.json`, SPDX → `.spdx.json`,
+  OpenVEX → `.openvex.json`. The DSSE envelope is preserved alongside as
+  `.dsse.json` for the audit trail.
+- Cosign verification, both **key-based** (`--key cosign.pub`) and **keyless**
+  (`--certificate-identity[-regexp] X --certificate-oidc-issuer Y`). Keyless
+  uses the bundled Sigstore public-good TUF root for Fulcio + Rekor by default
+  (`--trust-root <PEM>` for a private Sigstore deployment; `--insecure-ignore-tlog`
+  to skip Rekor for air-gapped use).
+- **Per-attestation** verification: Fulcio chain validation, SAN + OIDC-issuer
+  match, DSSE signature against the cert's pubkey, and in-toto subject digest
+  binding to the resolved image digest.
+- `oci verify --output sarif` emits a SARIF 2.1.0 document with rule index +
+  `SBOM-OCI-*` findings for CI/CD dashboards.
 
 ```sh
-# Pull the SBOM/VEX attached to a digest-pinned image (keyless cosign policy)
-sbom-tools oci pull ghcr.io/acme/api@sha256:abc... \
+# One-shot trustworthy vuln picture (keyless cosign + OSV enrichment)
+sbom-tools oci report ghcr.io/acme/api@sha256:abc... \
     --certificate-identity-regexp '^https://github.com/acme/.+' \
-    --certificate-oidc-issuer https://token.actions.githubusercontent.com
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --standard cra --fail-on-vex-gap
 
-# Verify an image's signature + attestations only (CI gate, SARIF out)
+# CI gate: SARIF + exit code 6 on any verification failure
 sbom-tools oci verify ghcr.io/acme/api:v1.4.0 \
-    --key cosign.pub --require-attestation https://cyclonedx.org/bom \
+    --key cosign.pub \
+    --require-attestation https://cyclonedx.org/bom \
     -o sarif -O oci-verify.sarif
 
-# One-shot: pull + verify + enrich + vulnerability picture
-sbom-tools oci report ghcr.io/acme/api:v1.4.0 \
-    --key cosign.pub --standard cra --fail-on-vex-gap
+# Pull artifacts only (skip verification — useful for inspection)
+sbom-tools oci pull ghcr.io/acme/api@sha256:abc... --no-verify
 ```
 
 See [`examples/oci-registry-ingestion.md`](examples/oci-registry-ingestion.md)

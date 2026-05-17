@@ -1,15 +1,11 @@
 # OCI Registry Ingestion — Worked Examples
 
-Pull and cosign-verify the SBOM/VEX artifacts attached to a container image,
-then feed them straight into the sbom-tools pipeline.
+Pull SBOM/VEX artifacts off any OCI registry, cosign-verify them (key-based
+or keyless, with Fulcio chain + Rekor inclusion + identity matching), and
+feed the unwrapped predicates straight into the sbom-tools pipeline.
 
-> **Status (preview).** The command surface, image-reference parsing, and
-> verification-policy validation are implemented and tested. The registry
-> client and cosign verification — the `sigstore` / `oci-client` dependencies
-> — are in progress. Until they land, the `oci` commands parse and validate
-> their inputs, print what they *would* fetch and verify, and exit with code
-> `3`. See [`docs/oci-verify-plan.md`](../docs/oci-verify-plan.md) for the
-> full design and phased plan.
+Built behind the off-by-default `oci` feature; see
+[`docs/oci-verify-plan.md`](../docs/oci-verify-plan.md) for the design.
 
 ## Building
 
